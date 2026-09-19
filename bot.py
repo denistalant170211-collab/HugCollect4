@@ -47,7 +47,10 @@ logger = logging.getLogger("hugbot")
 # ENV
 # =========================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN",
+    ""
+).strip()
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set")
@@ -78,7 +81,9 @@ WEBHOOK_BASE = (
 # PATHS
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(
+    __file__
+).resolve().parent
 
 
 ASSET_CANDIDATES = [
@@ -99,24 +104,54 @@ ASSETS_DIR = next(
 )
 
 
-PROFILE_BANNER = ASSETS_DIR / "profile_banner.png"
-MENU_BANNER = ASSETS_DIR / "menu_banner.png"
+PROFILE_BANNER = (
+    ASSETS_DIR / "profile_banner.png"
+)
+
+MENU_BANNER = (
+    ASSETS_DIR / "menu_banner.png"
+)
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-# На Render лучше указывать:
-# DB_PATH=/var/data/hugcollect.db
+# Если на Render подключен Persistent Disk
+# с Mount Path /var/data, автоматически используем
+# базу там.
 #
-# Локально, если переменная не задана,
-# база будет рядом с этим файлом.
+# Можно также явно указать:
+#
+# DB_PATH=/var/data/hugcollect.db
+
+RENDER_DATA_DIR = Path(
+    "/var/data"
+)
+
+
+if (
+    RENDER_DATA_DIR.exists()
+    and os.access(
+        RENDER_DATA_DIR,
+        os.W_OK
+    )
+):
+    DEFAULT_DB_PATH = (
+        RENDER_DATA_DIR
+        / "hugcollect.db"
+    )
+else:
+    DEFAULT_DB_PATH = (
+        BASE_DIR
+        / "hugcollect.db"
+    )
+
 
 DB_PATH = Path(
     os.environ.get(
         "DB_PATH",
-        str(BASE_DIR / "hugcollect.db")
+        str(DEFAULT_DB_PATH)
     )
 )
 
@@ -161,6 +196,12 @@ CRYPTO_FALLBACK_MONTH = os.environ.get(
 ).strip()
 
 
+CRYPTO_FALLBACK_YEAR = os.environ.get(
+    "CRYPTO_FALLBACK_YEAR",
+    ""
+).strip()
+
+
 # =========================================================
 # CHANNELS
 # =========================================================
@@ -177,6 +218,12 @@ MONTHLY_CHANNEL_ID = os.environ.get(
 ).strip()
 
 
+YEARLY_CHANNEL_ID = os.environ.get(
+    "YEARLY_CHANNEL_ID",
+    ""
+).strip()
+
+
 SUBSCRIPTION_CHANNEL_ID = os.environ.get(
     "SUBSCRIPTION_CHANNEL_ID",
     ""
@@ -184,8 +231,12 @@ SUBSCRIPTION_CHANNEL_ID = os.environ.get(
 
 
 REQUIRED_CHANNEL_ID = (
-    os.environ.get("REQUIRED_CHANNEL_ID")
-    or os.environ.get("REQUIRED_CHANNEL")
+    os.environ.get(
+        "REQUIRED_CHANNEL_ID"
+    )
+    or os.environ.get(
+        "REQUIRED_CHANNEL"
+    )
     or ""
 ).strip()
 
@@ -204,20 +255,58 @@ PLANS = {
     "week": {
         "title": "Недельная подписка",
         "days": 7,
+
+        # Старую цену CryptoBot оставляем
+        # как была.
         "usd": "5",
-        "stars": 400,
+
+        # НОВАЯ ЦЕНА STARS
+        "stars": 200,
+
         "channel": (
             WEEKLY_CHANNEL_ID
             or SUBSCRIPTION_CHANNEL_ID
         ),
     },
+
     "month": {
         "title": "Месячная подписка",
         "days": 30,
+
+        # Старую цену CryptoBot оставляем
+        # как была.
         "usd": "9",
-        "stars": 700,
+
+        # НОВАЯ ЦЕНА STARS
+        "stars": 350,
+
         "channel": (
             MONTHLY_CHANNEL_ID
+            or SUBSCRIPTION_CHANNEL_ID
+        ),
+    },
+
+    "year": {
+        "title": "Годовая подписка",
+        "days": 365,
+
+        # Для года цену в долларах
+        # лучше задать отдельно через:
+        #
+        # YEAR_PRICE_USD=...
+        #
+        # Пока Stars работают независимо.
+        "usd": os.environ.get(
+            "YEAR_PRICE_USD",
+            ""
+        ).strip(),
+
+        # НОВАЯ ЦЕНА STARS
+        "stars": 500,
+
+        "channel": (
+            YEARLY_CHANNEL_ID
+            or MONTHLY_CHANNEL_ID
             or SUBSCRIPTION_CHANNEL_ID
         ),
     },
@@ -394,8 +483,7 @@ def init_db():
             """
         )
 
-        # Уникальная защита от повторного использования
-        # одной и той же оплаты
+        # Защита от повторной выдачи одной оплаты
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -423,6 +511,7 @@ def init_db():
         ).fetchone()
 
         if not migrated:
+
             conn.execute(
                 """
                 UPDATE profiles
@@ -525,10 +614,15 @@ def get_active_subscription(
 ):
     """
     ВАЖНО:
-    SQLite больше не сравнивает даты напрямую.
 
-    Мы забираем подписки пользователя,
-    а сравнение даты делаем в Python.
+    SQLite не сравнивает даты подписки
+    через WHERE expires_at > ... .
+
+    Все записи пользователя загружаются,
+    после чего дата проверяется Python.
+
+    Это надёжнее для ISO datetime
+    с timezone.
     """
 
     now = datetime.now(
@@ -550,6 +644,7 @@ def get_active_subscription(
     for row in rows:
 
         try:
+
             expires_at = datetime.fromisoformat(
                 row["expires_at"]
             )
@@ -566,6 +661,14 @@ def get_active_subscription(
             ValueError,
             TypeError
         ):
+
+            logger.warning(
+                "Invalid subscription date: "
+                "user=%s expires_at=%s",
+                user_id,
+                row["expires_at"]
+            )
+
             continue
 
     return None
@@ -574,8 +677,11 @@ def get_active_subscription(
 def has_subscription(
     user_id: int
 ) -> bool:
+
     return (
-        get_active_subscription(user_id)
+        get_active_subscription(
+            user_id
+        )
         is not None
     )
 
@@ -621,6 +727,7 @@ def get_profile(
     )
 
     profile["sub"] = subscription
+
     profile["sub_active"] = (
         subscription is not None
     )
@@ -630,6 +737,7 @@ def get_profile(
     if subscription:
 
         try:
+
             expires_at = datetime.fromisoformat(
                 subscription["expires_at"]
             )
@@ -647,8 +755,7 @@ def get_profile(
             profile["sub_days_left"] = max(
                 0,
                 int(
-                    seconds_left
-                    / 86400
+                    seconds_left / 86400
                 )
             )
 
@@ -778,7 +885,11 @@ def get_payment(
             (payment_id,)
         ).fetchone()
 
-    return dict(row) if row else None
+    return (
+        dict(row)
+        if row
+        else None
+    )
 
 
 def find_subscription_by_payment(
@@ -796,7 +907,11 @@ def find_subscription_by_payment(
             (payment_id,)
         ).fetchone()
 
-    return dict(row) if row else None
+    return (
+        dict(row)
+        if row
+        else None
+    )
 
 
 # =========================================================
@@ -810,10 +925,18 @@ def activate_subscription(
     payment_id: str | None
 ):
     """
-    Выдаёт подписку и НЕ стирает старую.
+    Выдаёт подписку.
 
-    Если у пользователя уже есть активная подписка,
-    новая подписка начинается после её окончания.
+    Старую активную подписку не удаляет.
+
+    Если подписка уже активна:
+        новая начинается после старой.
+
+    Если подписки нет:
+        новая начинается сейчас.
+
+    Если payment_id уже использовался:
+        повторно подписка не создаётся.
     """
 
     if plan not in PLANS:
@@ -821,7 +944,10 @@ def activate_subscription(
             f"Unknown plan: {plan}"
         )
 
-    # Не начисляем одну и ту же оплату второй раз
+    # -------------------------
+    # Защита от повторной оплаты
+    # -------------------------
+
     if payment_id:
 
         existing = find_subscription_by_payment(
@@ -849,6 +975,10 @@ def activate_subscription(
         user_id
     )
 
+    # -------------------------
+    # Определяем начало
+    # -------------------------
+
     if current:
 
         current_exp = datetime.fromisoformat(
@@ -869,6 +999,10 @@ def activate_subscription(
 
         starts_at = now
 
+    # -------------------------
+    # Считаем окончание
+    # -------------------------
+
     expires_at = (
         starts_at
         + timedelta(
@@ -878,9 +1012,12 @@ def activate_subscription(
 
     now_iso = now.isoformat()
 
+    # -------------------------
+    # Запись
+    # -------------------------
+
     with db() as conn:
 
-        # Дополнительная защита от дубля оплаты
         if payment_id:
 
             already = conn.execute(
@@ -1254,6 +1391,7 @@ def redeem_promo(
             conn.commit()
 
         except sqlite3.IntegrityError:
+
             return "already", None
 
     return "ok", plan
@@ -1385,14 +1523,20 @@ def kb_sub_plans():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "Неделя — 5$ / 400⭐",
+                "Неделя — 200⭐",
                 callback_data="sub:week"
             )
         ],
         [
             InlineKeyboardButton(
-                "Месяц — 9$ / 700⭐",
+                "Месяц — 350⭐",
                 callback_data="sub:month"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Год — 500⭐",
+                callback_data="sub:year"
             )
         ],
         [
@@ -1411,13 +1555,17 @@ def kb_pay_methods(
         [
             InlineKeyboardButton(
                 "🪙 CryptoBot",
-                callback_data=f"pay:crypto:{plan}"
+                callback_data=(
+                    f"pay:crypto:{plan}"
+                )
             )
         ],
         [
             InlineKeyboardButton(
                 "⭐️ Telegram Stars",
-                callback_data=f"pay:stars:{plan}"
+                callback_data=(
+                    f"pay:stars:{plan}"
+                )
             )
         ],
         [
@@ -1435,6 +1583,7 @@ def kb_after_pay(
     rows = []
 
     if link:
+
         rows.append([
             InlineKeyboardButton(
                 "🔐 Получить доступ к каналу",
@@ -1456,7 +1605,9 @@ def kb_after_pay(
         )
     ])
 
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        rows
+    )
 
 
 def kb_channel_gate():
@@ -1465,6 +1616,7 @@ def kb_channel_gate():
     url = required_channel_url()
 
     if url:
+
         rows.append([
             InlineKeyboardButton(
                 "📢 Подписаться",
@@ -1479,7 +1631,9 @@ def kb_channel_gate():
         )
     ])
 
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        rows
+    )
 
 
 # =========================================================
@@ -1507,9 +1661,12 @@ def required_channel_url() -> str:
     if channel.startswith(
         "t.me/"
     ):
-        return f"https://{channel}"
+        return (
+            f"https://{channel}"
+        )
 
     if channel.startswith("@"):
+
         return (
             f"https://t.me/"
             f"{channel[1:]}"
@@ -1518,7 +1675,10 @@ def required_channel_url() -> str:
     if channel.lstrip("-").isdigit():
         return ""
 
-    return f"https://t.me/{channel}"
+    return (
+        f"https://t.me/"
+        f"{channel}"
+    )
 
 
 async def is_required_channel_member(
@@ -1546,7 +1706,10 @@ async def is_required_channel_member(
     except TelegramError as exc:
 
         logger.error(
-            "Channel subscription check error: %s",
+            "Required channel check failed: "
+            "channel=%s user=%s error=%s",
+            REQUIRED_CHANNEL_ID,
+            user_id,
             exc
         )
 
@@ -1570,10 +1733,11 @@ async def channel_gate(
     context: ContextTypes.DEFAULT_TYPE
 ):
     """
-    Проверяет обязательную подписку на канал.
+    Проверка обязательной подписки
+    на канал.
 
-    Не имеет никакого отношения к купленной
-    подписке в таблице subscriptions.
+    Это отдельная проверка и она НЕ удаляет
+    купленную подписку из таблицы subscriptions.
     """
 
     if not REQUIRED_CHANNEL_ID:
@@ -1586,18 +1750,26 @@ async def channel_gate(
 
     q = update.callback_query
 
-    # Кнопка проверки подписки
+    # -------------------------
+    # Проверка кнопкой
+    # -------------------------
+
     if (
         q
         and q.data == "gate:check"
     ):
 
-        await q.answer()
-
-        if await is_required_channel_member(
+        subscribed = await is_required_channel_member(
             context.bot,
             user.id
-        ):
+        )
+
+        if subscribed:
+
+            await q.answer(
+                "Подписка найдена ✅"
+            )
+
             await show_home(
                 update,
                 context
@@ -1617,17 +1789,18 @@ async def channel_gate(
 
         raise ApplicationHandlerStop
 
-    # Не блокируем pre_checkout
+    # Не блокируем оплату Stars
     if update.pre_checkout_query:
         return
 
-    # Не блокируем successful_payment
+    # Не блокируем успешную оплату
     if (
         update.message
         and update.message.successful_payment
     ):
         return
 
+    # Уже подписан
     if await is_required_channel_member(
         context.bot,
         user.id
@@ -1669,6 +1842,7 @@ async def send_ui(
     replace: bool = True
 ):
     chat_id = update.effective_chat.id
+
     q = update.callback_query
 
     if (
@@ -1676,6 +1850,7 @@ async def send_ui(
         and q
         and q.message
     ):
+
         await safe_delete(
             q.message
         )
@@ -1699,6 +1874,7 @@ async def send_ui(
                 return
 
         except Exception:
+
             logger.exception(
                 "Failed to send photo"
             )
@@ -1714,7 +1890,9 @@ async def show_home(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    context.user_data["state"] = None
+    context.user_data[
+        "state"
+    ] = None
 
     await send_ui(
         update,
@@ -1728,7 +1906,9 @@ async def show_profile(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
     profile = get_profile(
         user_id
@@ -1772,12 +1952,14 @@ async def show_support(
 
 
 def subscription_shop_text() -> str:
+
     return (
         "‼️ Доступ к основным функциям бота ‼️\n\n"
         "5️⃣0️⃣ запросов в день\n"
         "✔️ Защита пользователя\n\n"
-        "1️⃣ Цена на неделю — 5$ / 400⭐\n"
-        "2️⃣ Цена на месяц — 9$ / 700⭐\n\n"
+        "⭐️ Неделя — 200 Stars\n"
+        "⭐️ Месяц — 350 Stars\n"
+        "⭐️ Год — 500 Stars\n\n"
         "👇 Выберите срок подписки ниже 👇"
     )
 
@@ -1889,19 +2071,26 @@ async def run_hug_animation(
     target: str
 ):
     """
-    Первое сообщение уже отправляет
-    confirm_and_send_hug().
+    Первое сообщение уже отправлено
+    в confirm_and_send_hug().
 
-    Поэтому здесь НЕ пытаемся повторно
-    редактировать его.
+    Здесь оно повторно НЕ отправляется,
+    поэтому дубля больше нет.
     """
 
     count = 356
 
     try:
 
-        # Первая пауза
+        # -------------------------
+        # Стартовая пауза
+        # -------------------------
+
         await asyncio.sleep(1)
+
+        # -------------------------
+        # Проценты
+        # -------------------------
 
         progress_steps = [
             8,
@@ -1920,24 +2109,36 @@ async def run_hug_animation(
                 text=f"💤{percent}%💤"
             )
 
+            # Ровно 1 секунда
             await asyncio.sleep(1)
 
+        # -------------------------
         # 100%
+        # -------------------------
+
         await bot.send_message(
             chat_id=chat_id,
             text="💤100%💤"
         )
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(
+            0.5
+        )
 
-        # Сохраняем один результат
+        # -------------------------
+        # Запись результата
+        # -------------------------
+
         add_hug(
             user_id,
             target,
             count
         )
 
+        # -------------------------
         # Финал
+        # -------------------------
+
         await bot.send_message(
             chat_id=chat_id,
             text=(
@@ -1991,6 +2192,7 @@ async def confirm_and_send_hug(
         context,
         user_id
     ):
+
         context.user_data[
             "state"
         ] = None
@@ -2035,9 +2237,13 @@ async def confirm_and_send_hug(
     )
 
     chat_id = update.effective_chat.id
+
     q = update.callback_query
 
-    # Нажатие кнопки подтверждения
+    # -------------------------
+    # Кнопка подтверждения
+    # -------------------------
+
     if (
         q
         and q.message
@@ -2055,14 +2261,16 @@ async def confirm_and_send_hug(
 
         except BadRequest:
 
-            # Если сообщение нельзя изменить
-            # отправляем новое
             msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=initial_text
             )
 
             msg_id = msg.message_id
+
+    # -------------------------
+    # Обычное сообщение
+    # -------------------------
 
     elif update.message:
 
@@ -2071,6 +2279,10 @@ async def confirm_and_send_hug(
         )
 
         msg_id = msg.message_id
+
+    # -------------------------
+    # Запасной вариант
+    # -------------------------
 
     else:
 
@@ -2081,8 +2293,10 @@ async def confirm_and_send_hug(
 
         msg_id = msg.message_id
 
-    # ВАЖНО:
-    # дальше процесс идёт отдельно
+    # -------------------------
+    # Запуск анимации
+    # -------------------------
+
     context.application.create_task(
         run_hug_animation(
             context.bot,
@@ -2254,6 +2468,7 @@ async def nav_callback(
     q = update.callback_query
 
     user_id = q.from_user.id
+
     data = q.data
 
     ensure_profile(
@@ -2261,10 +2476,15 @@ async def nav_callback(
     )
 
     try:
+
         await q.answer()
 
     except TelegramError:
         pass
+
+    # -------------------------
+    # HOME
+    # -------------------------
 
     if data == "nav:home":
 
@@ -2275,6 +2495,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # PROFILE
+    # -------------------------
+
     if data == "nav:profile":
 
         await show_profile(
@@ -2283,6 +2507,10 @@ async def nav_callback(
         )
 
         return
+
+    # -------------------------
+    # MENU
+    # -------------------------
 
     if data == "nav:menu":
 
@@ -2293,6 +2521,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # SUPPORT
+    # -------------------------
+
     if data == "nav:support":
 
         await show_support(
@@ -2302,6 +2534,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # SUBSCRIPTION
+    # -------------------------
+
     if data == "nav:sub":
 
         await show_subscription(
@@ -2310,6 +2546,10 @@ async def nav_callback(
         )
 
         return
+
+    # -------------------------
+    # PROMO
+    # -------------------------
 
     if data == "nav:promo":
 
@@ -2326,6 +2566,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # HUG
+    # -------------------------
+
     if data == "menu:hug":
 
         await start_hug(
@@ -2335,6 +2579,10 @@ async def nav_callback(
         )
 
         return
+
+    # -------------------------
+    # SEARCH
+    # -------------------------
 
     if data == "menu:search":
 
@@ -2346,6 +2594,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # CHECK
+    # -------------------------
+
     if data == "menu:check":
 
         await start_check(
@@ -2356,6 +2608,10 @@ async def nav_callback(
 
         return
 
+    # -------------------------
+    # HISTORY
+    # -------------------------
+
     if data == "menu:history":
 
         await show_history(
@@ -2365,6 +2621,10 @@ async def nav_callback(
         )
 
         return
+
+    # -------------------------
+    # YES
+    # -------------------------
 
     if data == "hug:yes":
 
@@ -2391,6 +2651,10 @@ async def nav_callback(
         )
 
         return
+
+    # -------------------------
+    # NO
+    # -------------------------
 
     if data == "hug:no":
 
@@ -2427,15 +2691,16 @@ async def subscription_callback(
         pass
 
     user_id = q.from_user.id
+
     data = q.data
 
     ensure_profile(
         user_id
     )
 
-    # -------------------------
+    # =====================================================
     # PLAN
-    # -------------------------
+    # =====================================================
 
     if (
         data.startswith("sub:")
@@ -2449,11 +2714,23 @@ async def subscription_callback(
 
         p = PLANS[plan]
 
+        if p["usd"]:
+
+            price_text = (
+                f"{p['usd']}$ / "
+                f"{p['stars']}⭐"
+            )
+
+        else:
+
+            price_text = (
+                f"{p['stars']}⭐"
+            )
+
         text = (
             f"💎 {p['title']}\n\n"
             f"⏳ Срок — {p['days']} дней\n"
-            f"💵 Цена — {p['usd']}$\n"
-            f"⭐️ Stars — {p['stars']}\n\n"
+            f"💵 Цена — {price_text}\n\n"
             "После оплаты подписка выдаётся "
             "автоматически.\n\n"
             "Выберите способ оплаты:"
@@ -2468,9 +2745,9 @@ async def subscription_callback(
 
         return
 
-    # -------------------------
+    # =====================================================
     # BACK
-    # -------------------------
+    # =====================================================
 
     if data == "pay:back":
 
@@ -2481,9 +2758,9 @@ async def subscription_callback(
 
         return
 
-    # -------------------------
+    # =====================================================
     # CRYPTOBOT
-    # -------------------------
+    # =====================================================
 
     if data.startswith(
         "pay:crypto:"
@@ -2494,14 +2771,75 @@ async def subscription_callback(
         if plan not in PLANS:
             return
 
-        # Crypto API не настроен
+        crypto_price = PLANS[plan]["usd"]
+
+        # -------------------------
+        # Год без USD цены
+        # -------------------------
+
+        if (
+            not crypto_price
+            and not (
+                CRYPTO_FALLBACK_YEAR
+                if plan == "year"
+                else False
+            )
+        ):
+
+            fallback = None
+
+            if plan == "week":
+                fallback = (
+                    CRYPTO_FALLBACK_WEEK
+                )
+
+            elif plan == "month":
+                fallback = (
+                    CRYPTO_FALLBACK_MONTH
+                )
+
+            elif plan == "year":
+                fallback = (
+                    CRYPTO_FALLBACK_YEAR
+                )
+
+            if not fallback:
+
+                await send_ui(
+                    update,
+                    context,
+                    (
+                        "⚠️ Для этого тарифа "
+                        "CryptoBot пока не настроен.\n\n"
+                        "Используйте Telegram Stars."
+                    ),
+                    kb_pay_methods(plan)
+                )
+
+                return
+
+        # -------------------------
+        # Token не указан
+        # -------------------------
+
         if not CRYPTO_PAY_API_TOKEN:
 
-            fallback = (
-                CRYPTO_FALLBACK_WEEK
-                if plan == "week"
-                else CRYPTO_FALLBACK_MONTH
-            )
+            fallback = None
+
+            if plan == "week":
+                fallback = (
+                    CRYPTO_FALLBACK_WEEK
+                )
+
+            elif plan == "month":
+                fallback = (
+                    CRYPTO_FALLBACK_MONTH
+                )
+
+            elif plan == "year":
+                fallback = (
+                    CRYPTO_FALLBACK_YEAR
+                )
 
             if fallback:
 
@@ -2516,8 +2854,7 @@ async def subscription_callback(
                         InlineKeyboardButton(
                             "Я оплатил",
                             callback_data=(
-                                f"manual_crypto:"
-                                f"{plan}"
+                                f"manual_crypto:{plan}"
                             )
                         )
                     ],
@@ -2537,7 +2874,7 @@ async def subscription_callback(
                         "После оплаты нажмите "
                         "«Я оплатил».\n\n"
                         "⚠️ Автоматическая проверка "
-                        "будет работать после настройки "
+                        "не работает без "
                         "CRYPTO_PAY_API_TOKEN."
                     ),
                     markup
@@ -2580,7 +2917,9 @@ async def subscription_callback(
             )
 
             url = (
-                invoice.get("bot_invoice_url")
+                invoice.get(
+                    "bot_invoice_url"
+                )
                 or invoice.get(
                     "mini_app_invoice_url"
                 )
@@ -2588,6 +2927,12 @@ async def subscription_callback(
                     "web_app_invoice_url"
                 )
             )
+
+            if not url:
+                raise RuntimeError(
+                    "CryptoBot did not return "
+                    "invoice URL"
+                )
 
             markup = InlineKeyboardMarkup([
                 [
@@ -2620,10 +2965,9 @@ async def subscription_callback(
                 context,
                 (
                     "💳 Оплата подписки\n\n"
-                    f"{PLANS[plan]['title']} — "
-                    f"{PLANS[plan]['usd']}$\n\n"
-                    "Нажмите кнопку «Оплатить».\n"
-                    "После оплаты бот автоматически "
+                    f"{PLANS[plan]['title']}\n\n"
+                    "После успешной оплаты "
+                    "бот автоматически "
                     "выдаст подписку."
                 ),
                 markup
@@ -2650,17 +2994,16 @@ async def subscription_callback(
                 context,
                 (
                     "❌ Не удалось создать счёт.\n\n"
-                    "Попробуйте ещё раз или "
-                    "выберите Telegram Stars."
+                    "Попробуйте Telegram Stars."
                 ),
                 kb_pay_methods(plan)
             )
 
         return
 
-    # -------------------------
+    # =====================================================
     # TELEGRAM STARS
-    # -------------------------
+    # =====================================================
 
     if data.startswith(
         "pay:stars:"
@@ -2694,7 +3037,7 @@ async def subscription_callback(
                 chat_id=user_id,
                 title=p["title"],
                 description=(
-                    f"Доступ к функциям бота "
+                    "Доступ к функциям бота "
                     f"на {p['days']} дней."
                 ),
                 payload=(
@@ -2718,7 +3061,8 @@ async def subscription_callback(
                 (
                     "⭐️ Оплатите счёт выше.\n\n"
                     "После успешной оплаты "
-                    "подписка активируется автоматически."
+                    "подписка активируется "
+                    "автоматически."
                 ),
                 reply_markup=InlineKeyboardMarkup([
                     [
@@ -2752,9 +3096,9 @@ async def subscription_callback(
 
         return
 
-    # -------------------------
+    # =====================================================
     # CANCEL
-    # -------------------------
+    # =====================================================
 
     if data == "pay:cancel":
 
@@ -2767,9 +3111,9 @@ async def subscription_callback(
 
         return
 
-    # -------------------------
+    # =====================================================
     # CRYPTO CHECK
-    # -------------------------
+    # =====================================================
 
     if data.startswith(
         "check_crypto:"
@@ -2780,9 +3124,25 @@ async def subscription_callback(
         if len(parts) < 4:
             return
 
-        _, invoice_id, plan, payment_db_id = (
-            parts[:4]
-        )
+        try:
+
+            invoice_id = parts[1]
+            plan = parts[2]
+            payment_db_id = int(
+                parts[3]
+            )
+
+        except (
+            ValueError,
+            IndexError
+        ):
+
+            await q.answer(
+                "Некорректные данные оплаты.",
+                show_alert=True
+            )
+
+            return
 
         if plan not in PLANS:
             return
@@ -2816,7 +3176,8 @@ async def subscription_callback(
             result = await crypto_api(
                 "getInvoices",
                 {
-                    "invoice_ids": str(invoice_id)
+                    "invoice_ids":
+                        str(invoice_id)
                 }
             )
 
@@ -2837,7 +3198,7 @@ async def subscription_callback(
                     plan,
                     "cryptobot",
                     str(invoice_id),
-                    int(payment_db_id)
+                    payment_db_id
                 )
 
                 await safe_delete(
@@ -2849,7 +3210,8 @@ async def subscription_callback(
             await q.answer(
                 (
                     "Оплата ещё не найдена.\n"
-                    "Подождите немного и попробуйте снова."
+                    "Подождите немного и "
+                    "попробуйте снова."
                 ),
                 show_alert=True
             )
@@ -2891,7 +3253,10 @@ async def crypto_api(
     ) as client:
 
         response = await client.post(
-            f"https://pay.crypt.bot/api/{method}",
+            (
+                "https://pay.crypt.bot/"
+                f"api/{method}"
+            ),
             json=payload,
             headers=headers
         )
@@ -2919,6 +3284,19 @@ async def create_crypto_invoice(
     user_id: int,
     plan: str
 ):
+    if plan not in PLANS:
+        raise ValueError(
+            f"Unknown plan: {plan}"
+        )
+
+    amount = PLANS[plan]["usd"]
+
+    if not amount:
+        raise RuntimeError(
+            f"USD price is not configured "
+            f"for plan={plan}"
+        )
+
     payload_id = (
         f"hug:"
         f"{user_id}:"
@@ -2930,8 +3308,10 @@ async def create_crypto_invoice(
         "createInvoice",
         {
             "asset": CRYPTO_ASSET,
-            "amount": PLANS[plan]["usd"],
-            "description": PLANS[plan]["title"],
+            "amount": amount,
+            "description": (
+                PLANS[plan]["title"]
+            ),
             "payload": payload_id,
             "allow_comments": False,
             "allow_anonymous": False,
@@ -3027,16 +3407,41 @@ async def issue_channel_invite(
     user_id: int,
     plan: str
 ):
-    channel = PLANS[plan]["channel"]
+    if plan not in PLANS:
+        return None, "no_channel"
+
+    channel = (
+        PLANS[plan]["channel"]
+    )
 
     if not channel:
+
+        logger.error(
+            "CHANNEL NOT CONFIGURED: "
+            "plan=%s user=%s",
+            plan,
+            user_id
+        )
+
         return None, "no_channel"
+
+    logger.info(
+        "Channel invite: "
+        "plan=%s channel=%s user=%s",
+        plan,
+        channel,
+        user_id
+    )
+
+    # -------------------------
+    # Проверяем участника
+    # -------------------------
 
     try:
 
         member = await bot.get_chat_member(
-            channel,
-            user_id
+            chat_id=channel,
+            user_id=user_id
         )
 
         if member.status in {
@@ -3044,16 +3449,32 @@ async def issue_channel_invite(
             "administrator",
             "creator"
         }:
-            return None, "already_member"
 
-    except TelegramError:
-        pass
+            return (
+                None,
+                "already_member"
+            )
+
+    except TelegramError as exc:
+
+        logger.warning(
+            "Could not check channel member: "
+            "plan=%s channel=%s user=%s error=%s",
+            plan,
+            channel,
+            user_id,
+            exc
+        )
+
+    # -------------------------
+    # Срок ссылки
+    # -------------------------
 
     subscription = get_active_subscription(
         user_id
     )
 
-    expire_ts = None
+    expire_date = None
 
     if subscription:
 
@@ -3068,15 +3489,17 @@ async def issue_channel_invite(
                     tzinfo=timezone.utc
                 )
 
-            expire_ts = int(
-                expires_at.timestamp()
-            )
+            expire_date = expires_at
 
         except (
             ValueError,
             TypeError
         ):
             pass
+
+    # -------------------------
+    # Создание ссылки
+    # -------------------------
 
     try:
 
@@ -3086,7 +3509,15 @@ async def issue_channel_invite(
                 f"user {user_id} {plan}"
             ),
             member_limit=1,
-            expire_date=expire_ts
+            expire_date=expire_date
+        )
+
+        logger.info(
+            "Invite link created: "
+            "plan=%s channel=%s user=%s",
+            plan,
+            channel,
+            user_id
         )
 
         return (
@@ -3094,10 +3525,30 @@ async def issue_channel_invite(
             "ok"
         )
 
-    except TelegramError:
+    except BadRequest as exc:
 
-        logger.exception(
-            "Could not create invite link"
+        logger.error(
+            "CHANNEL INVITE FAILED: "
+            "plan=%s channel=%s user=%s "
+            "error=%s",
+            plan,
+            channel,
+            user_id,
+            exc
+        )
+
+        return None, "error"
+
+    except TelegramError as exc:
+
+        logger.error(
+            "CHANNEL INVITE TELEGRAM ERROR: "
+            "plan=%s channel=%s user=%s "
+            "error=%s",
+            plan,
+            channel,
+            user_id,
+            exc
         )
 
         return None, "error"
@@ -3108,6 +3559,11 @@ def access_granted_text(
     expires: datetime,
     invite_status: str
 ):
+    if expires.tzinfo is None:
+        expires = expires.replace(
+            tzinfo=timezone.utc
+        )
+
     text = (
         "✅ Оплата получена!\n\n"
         f"💎 Подписка — "
@@ -3134,14 +3590,15 @@ def access_granted_text(
     elif invite_status == "error":
 
         text += (
-            f"\n\n⚠️ Не удалось выдать "
-            f"ссылку в канал.\n"
+            "\n\n⚠️ Не удалось выдать "
+            "ссылку в канал.\n"
             f"Напишите {SUPPORT_USERNAME}."
         )
 
     return text
 
 
+# Оплаты, которые уже были уведомлены
 _notified_payments: set[str] = set()
 
 
@@ -3153,7 +3610,40 @@ async def grant_paid_access(
     payment_key: str,
     payment_db_id: int | None = None
 ):
-    # Не выдаём одну оплату второй раз
+    # -------------------------
+    # Уже существует
+    # -------------------------
+
+    existing = find_subscription_by_payment(
+        payment_key
+    )
+
+    if existing:
+
+        try:
+
+            expires = datetime.fromisoformat(
+                existing["expires_at"]
+            )
+
+            if expires.tzinfo is None:
+                expires = expires.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return expires
+
+        except (
+            ValueError,
+            TypeError
+        ):
+
+            return None
+
+    # -------------------------
+    # Не даём повторную выдачу
+    # -------------------------
+
     if payment_key in _notified_payments:
 
         return activate_subscription(
@@ -3163,23 +3653,13 @@ async def grant_paid_access(
             payment_key
         )
 
-    existing = find_subscription_by_payment(
-        payment_key
-    )
-
-    if existing:
-
-        _notified_payments.add(
-            payment_key
-        )
-
-        return datetime.fromisoformat(
-            existing["expires_at"]
-        )
-
     _notified_payments.add(
         payment_key
     )
+
+    # -------------------------
+    # Обновляем payment
+    # -------------------------
 
     if payment_db_id:
 
@@ -3189,6 +3669,10 @@ async def grant_paid_access(
             payment_key
         )
 
+    # -------------------------
+    # Активируем
+    # -------------------------
+
     expires = activate_subscription(
         user_id,
         plan,
@@ -3196,10 +3680,16 @@ async def grant_paid_access(
         payment_key
     )
 
-    link, invite_status = await issue_channel_invite(
-        bot,
-        user_id,
-        plan
+    # -------------------------
+    # Ссылка в канал
+    # -------------------------
+
+    link, invite_status = (
+        await issue_channel_invite(
+            bot,
+            user_id,
+            plan
+        )
     )
 
     text = access_granted_text(
@@ -3217,7 +3707,9 @@ async def grant_paid_access(
     await bot.send_message(
         user_id,
         text,
-        reply_markup=kb_after_pay(link)
+        reply_markup=kb_after_pay(
+            link
+        )
     )
 
     return expires
@@ -3235,7 +3727,6 @@ async def grant_promo_access(
         f"{user_id}"
     )
 
-    # Промокод тоже не выдаём дважды
     existing = find_subscription_by_payment(
         payment_key
     )
@@ -3246,6 +3737,11 @@ async def grant_promo_access(
             existing["expires_at"]
         )
 
+        if expires.tzinfo is None:
+            expires = expires.replace(
+                tzinfo=timezone.utc
+            )
+
     else:
 
         expires = activate_subscription(
@@ -3255,10 +3751,12 @@ async def grant_promo_access(
             payment_key
         )
 
-    link, invite_status = await issue_channel_invite(
-        bot,
-        user_id,
-        plan
+    link, invite_status = (
+        await issue_channel_invite(
+            bot,
+            user_id,
+            plan
+        )
     )
 
     text = (
@@ -3270,14 +3768,25 @@ async def grant_promo_access(
     )
 
     if link:
+
         text += (
             "\n\n👇 Ссылка в канал:"
+        )
+
+    elif invite_status == "error":
+
+        text += (
+            "\n\n⚠️ Ссылка в канал "
+            "не была создана.\n"
+            f"Напишите {SUPPORT_USERNAME}."
         )
 
     await bot.send_message(
         user_id,
         text,
-        reply_markup=kb_after_pay(link)
+        reply_markup=kb_after_pay(
+            link
+        )
     )
 
     return expires
@@ -3314,7 +3823,8 @@ async def apply_promo_text(
     if status == "already":
 
         await update.message.reply_text(
-            "❌ Вы уже использовали этот промокод.",
+            "❌ Вы уже использовали "
+            "этот промокод.",
             reply_markup=kb_profile()
         )
 
@@ -3323,7 +3833,8 @@ async def apply_promo_text(
     if status == "exhausted":
 
         await update.message.reply_text(
-            "❌ Этот промокод больше недоступен.",
+            "❌ Этот промокод больше "
+            "недоступен.",
             reply_markup=kb_profile()
         )
 
@@ -3396,7 +3907,9 @@ async def successful_payment(
         .successful_payment
     )
 
-    payload = payment.invoice_payload
+    payload = (
+        payment.invoice_payload
+    )
 
     parts = payload.split(":")
 
@@ -3474,18 +3987,23 @@ async def cmd_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
-    # Только создаём профиль, если его нет.
-    # НИЧЕГО НЕ СБРАСЫВАЕМ.
+    # Только создаём профиль,
+    # если его ещё нет.
+    #
+    # Подписка здесь НЕ удаляется.
     ensure_profile(
         user_id
     )
 
     # Просто читаем текущую подписку.
-    # Она не изменяется.
-    subscription = get_active_subscription(
-        user_id
+    subscription = (
+        get_active_subscription(
+            user_id
+        )
     )
 
     if subscription:
@@ -3553,9 +4071,9 @@ async def handle_text(
         "state"
     )
 
-    # -------------------------
+    # =====================================================
     # HUG TARGET
-    # -------------------------
+    # =====================================================
 
     if state == "awaiting_hug_target":
 
@@ -3577,9 +4095,9 @@ async def handle_text(
 
         return
 
-    # -------------------------
+    # =====================================================
     # CONFIRM
-    # -------------------------
+    # =====================================================
 
     if state == "awaiting_confirm":
 
@@ -3590,9 +4108,9 @@ async def handle_text(
 
         return
 
-    # -------------------------
+    # =====================================================
     # PROMO
-    # -------------------------
+    # =====================================================
 
     if state == "awaiting_promo":
 
@@ -3616,9 +4134,9 @@ async def handle_text(
 
         return
 
-    # -------------------------
+    # =====================================================
     # CHECK
-    # -------------------------
+    # =====================================================
 
     if state == "awaiting_check_target":
 
@@ -3635,9 +4153,9 @@ async def handle_text(
 
         return
 
-    # -------------------------
+    # =====================================================
     # SEARCH
-    # -------------------------
+    # =====================================================
 
     if state == "awaiting_search":
 
@@ -3682,9 +4200,9 @@ async def handle_text(
 
         return
 
-    # -------------------------
+    # =====================================================
     # ПРОМОКОД БЕЗ STATE
-    # -------------------------
+    # =====================================================
 
     applied = await apply_promo_text(
         update,
@@ -3749,10 +4267,6 @@ async def expiration_loop(
 
         try:
 
-            now = datetime.now(
-                timezone.utc
-            )
-
             with db() as conn:
 
                 rows = conn.execute(
@@ -3766,8 +4280,6 @@ async def expiration_loop(
 
                 user_id = row["user_id"]
 
-                # Если активной подписки больше нет,
-                # можно убрать пользователя из каналов.
                 if not has_subscription(
                     user_id
                 ):
@@ -3778,6 +4290,7 @@ async def expiration_loop(
                     )
 
         except asyncio.CancelledError:
+
             raise
 
         except Exception:
@@ -3823,9 +4336,9 @@ def main():
         .build()
     )
 
-    # -----------------------------------------------------
-    # ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ
-    # -----------------------------------------------------
+    # =====================================================
+    # REQUIRED CHANNEL
+    # =====================================================
 
     app.add_handler(
         TypeHandler(
@@ -3835,9 +4348,9 @@ def main():
         group=-1
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # START
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3846,9 +4359,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # NAVIGATION
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         CallbackQueryHandler(
@@ -3859,9 +4372,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # SUBSCRIPTIONS
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         CallbackQueryHandler(
@@ -3874,9 +4387,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # STARS PRECHECKOUT
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         PreCheckoutQueryHandler(
@@ -3884,9 +4397,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # SUCCESSFUL PAYMENT
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         MessageHandler(
@@ -3895,9 +4408,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # TEXT
-    # -----------------------------------------------------
+    # =====================================================
 
     app.add_handler(
         MessageHandler(
@@ -3907,9 +4420,9 @@ def main():
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # RENDER WEBHOOK
-    # -----------------------------------------------------
+    # =====================================================
 
     if WEBHOOK_BASE:
 
@@ -3921,8 +4434,7 @@ def main():
         )
 
         logger.info(
-            "Starting webhook: %s",
-            webhook_url
+            "Starting webhook"
         )
 
         app.run_webhook(
@@ -3933,9 +4445,9 @@ def main():
             drop_pending_updates=True
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # LOCAL POLLING
-    # -----------------------------------------------------
+    # =====================================================
 
     else:
 
