@@ -110,14 +110,12 @@ SUBSCRIPTION_CHANNEL_ID = os.environ.get(
     ""
 ).strip()
 
-# Канал, на который пользователь обязан подписаться
 REQUIRED_CHANNEL_ID = (
     os.environ.get("REQUIRED_CHANNEL_ID")
     or os.environ.get("REQUIRED_CHANNEL")
     or ""
 ).strip()
 
-# Ссылка, которая будет показана пользователю
 REQUIRED_CHANNEL_URL = os.environ.get(
     "REQUIRED_CHANNEL_URL",
     ""
@@ -370,17 +368,11 @@ CHANNEL_GATE_TEXT = (
 )
 
 
-# =========================================================
-# ПРОВЕРКА ПОДПИСКИ
-# =========================================================
-
 async def is_required_channel_member(
     bot,
     user_id: int
 ) -> bool:
 
-    # Если канал вообще не указан,
-    # не блокируем пользователя.
     if not REQUIRED_CHANNEL_ID:
         logger.warning(
             "REQUIRED_CHANNEL_ID is not configured. "
@@ -402,8 +394,6 @@ async def is_required_channel_member(
             member.status
         )
 
-        # Пользователь считается подписанным,
-        # если Telegram вернул один из этих статусов.
         is_member = member.status in {
             "creator",
             "administrator",
@@ -485,17 +475,14 @@ async def channel_gate(
     if not user or user.is_bot:
         return
 
-    # Не блокируем pre_checkout
     if update.pre_checkout_query:
         return
 
-    # Не блокируем успешную оплату
     if update.message and update.message.successful_payment:
         return
 
     q = update.callback_query
 
-    # Пользователь нажал "Проверить подписку"
     if q and q.data == "gate:check":
 
         subscribed = await is_required_channel_member(
@@ -515,7 +502,6 @@ async def channel_gate(
 
         raise ApplicationHandlerStop
 
-    # Для любого другого действия проверяем подписку
     if await is_required_channel_member(
         context.bot,
         user.id
@@ -1935,6 +1921,10 @@ async def crypto_watch(
     )
 
 
+# =========================================================
+# НОВАЯ АНИМАЦИЯ ОТПРАВКИ ОБНИМАШЕК
+# =========================================================
+
 async def run_hug_animation(
     bot,
     chat_id: int,
@@ -1944,52 +1934,82 @@ async def run_hug_animation(
 ):
     count = random.randint(12, 48)
 
-    stage = HUG_STAGES[0][1]
+    # Первое сообщение.
+    # Оно заменяет старое сообщение с прогрессом 0%.
+    start_text = (
+        "💤Идет процесс отправления обнимашек 💤\n\n"
+        "3%\n\n"
+        "🔰Ожидание до 1 минуты🔰"
+    )
 
     try:
-        for percent in range(0, 101, 8):
-
-            for p, label in HUG_STAGES:
-                if percent >= p:
-                    stage = label
-
-            text = hug_progress_text(
-                target,
-                percent,
-                stage
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=start_text
+            )
+        except BadRequest:
+            # Если старое сообщение нельзя изменить,
+            # отправляем новое.
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=start_text
             )
 
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text
-                )
+            message_id = msg.message_id
 
-            except BadRequest:
-                pass
+        # Реальное ожидание.
+        # От 10 до 60 секунд.
+        await asyncio.sleep(
+            random.randint(10, 60)
+        )
 
-            await asyncio.sleep(0.32)
+        # Отдельные сообщения с прогрессом.
+        progress_steps = [
+            8,
+            20,
+            34,
+            49,
+            68,
+            71,
+            90,
+        ]
 
+        for percent in progress_steps:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"💤{percent}%💤"
+            )
+
+            # Небольшая пауза между сообщениями.
+            await asyncio.sleep(
+                random.uniform(0.8, 1.8)
+            )
+
+        # Финальный процент.
+        await bot.send_message(
+            chat_id=chat_id,
+            text="💤100%💤"
+        )
+
+        await asyncio.sleep(0.5)
+
+        # Записываем обнимашки в БД только после
+        # успешного завершения процесса.
         add_hug(
             user_id,
             target,
             count
         )
 
+        # Финальное сообщение.
         done = (
-            "╭────────────────────╮\n"
-            "│  ✅ Доставлено!    │\n"
-            "╰────────────────────╯\n\n"
-            f"🤗 Получатель: {target}\n"
-            f"💕 Обнимашек: {count}\n"
-            "🔥 +10 теплоты\n\n"
-            "Объятие успешно отправлено ✨"
+            f"⭕️Отправлено обнимашек — {count}⭕️"
         )
 
-        await bot.edit_message_text(
+        await bot.send_message(
             chat_id=chat_id,
-            message_id=message_id,
             text=done,
             reply_markup=kb_hooray()
         )
@@ -2008,9 +2028,7 @@ async def run_hug_animation(
 
             await bot.send_message(
                 chat_id,
-                f"✅ Обнимашки отправлены "
-                f"{target}! 🤗\n"
-                f"💕 Количество: {count}",
+                f"⭕️Отправлено обнимашек — {count}⭕️",
                 reply_markup=kb_hooray()
             )
 
@@ -2992,8 +3010,6 @@ def main():
         .build()
     )
 
-    # Проверка подписки запускается раньше
-    # остальных обработчиков.
     app.add_handler(
         TypeHandler(
             Update,
