@@ -18,11 +18,13 @@ from telegram import (
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     CallbackQueryHandler,
     PreCheckoutQueryHandler,
+    TypeHandler,
     filters,
 )
 
@@ -63,6 +65,13 @@ CRYPTO_ASSET = os.environ.get("CRYPTO_ASSET", "USDT").strip().upper()
 WEEKLY_CHANNEL_ID = os.environ.get("WEEKLY_CHANNEL_ID", "").strip()
 MONTHLY_CHANNEL_ID = os.environ.get("MONTHLY_CHANNEL_ID", "").strip()
 SUBSCRIPTION_CHANNEL_ID = os.environ.get("SUBSCRIPTION_CHANNEL_ID", "").strip()
+REQUIRED_CHANNEL_ID = (
+    os.environ.get("REQUIRED_CHANNEL_ID")
+    or os.environ.get("REQUIRED_CHANNEL")
+    or ""
+).strip()
+REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "").strip()
+logger.info("REQUIRED_CHANNEL_ID=%s", REQUIRED_CHANNEL_ID or "(not set)")
 
 PLANS = {
     "week": {
@@ -195,6 +204,93 @@ def init_db():
                 (PROMO_CODE, plan, max_uses),
             )
         conn.commit()
+
+
+def required_channel_url() -> str:
+    if REQUIRED_CHANNEL_URL:
+        return REQUIRED_CHANNEL_URL
+    ch = REQUIRED_CHANNEL_ID.lstrip()
+    if ch.startswith("https://"):
+        return ch
+    if ch.startswith("@"):
+        return f"https://t.me/{ch[1:]}"
+    if ch.startswith("t.me/"):
+        return f"https://{ch}"
+    if ch and not ch.lstrip("-").isdigit():
+        return f"https://t.me/{ch}"
+    return ""
+
+
+def kb_channel_gate():
+    rows = []
+    url = required_channel_url()
+    if url:
+        rows.append([InlineKeyboardButton("📢 Подписаться", url=url)])
+    rows.append([InlineKeyboardButton("✅ Проверить подписку", callback_data="gate:check")])
+    return InlineKeyboardMarkup(rows)
+
+
+CHANNEL_GATE_TEXT = (
+    "🔒 Сначала подпишитесь на канал\n\n"
+    "Без подписки бот закрыт: меню, кабинет и функции недоступны.\n\n"
+    "1️⃣ Нажмите «Подписаться»\n"
+    "2️⃣ Подпишитесь на канал\n"
+    "3️⃣ Вернитесь сюда и нажмите «Проверить подписку»"
+)
+
+
+async def is_required_channel_member(bot, user_id: int) -> bool:
+    if not REQUIRED_CHANNEL_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        return member.status in {"creator", "administrator", "member", "restricted"}
+    except TelegramError as exc:
+        logger.warning("Channel membership check failed for user=%s: %s", user_id, exc)
+        return False
+
+
+async def show_channel_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        text = update.message.text or ""
+        if text.startswith("/start"):
+            await update.message.reply_text("Меню перенесено в сообщение 👇", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(CHANNEL_GATE_TEXT, reply_markup=kb_channel_gate())
+        return
+    await send_ui(update, context, CHANNEL_GATE_TEXT, kb_channel_gate())
+
+
+async def channel_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not REQUIRED_CHANNEL_ID:
+        return
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        return
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    if update.pre_checkout_query:
+        return
+    if update.message and update.message.successful_payment:
+        return
+
+    q = update.callback_query
+    if q and q.data == "gate:check":
+        if await is_required_channel_member(context.bot, user.id):
+            await q.answer("Подписка найдена ✅")
+            await show_home(update, context)
+        else:
+            await q.answer("Вы ещё не подписаны на канал.", show_alert=True)
+            await show_channel_gate(update, context)
+        raise ApplicationHandlerStop
+
+    if await is_required_channel_member(context.bot, user.id):
+        return
+
+    if q:
+        await q.answer("Сначала подпишитесь на канал.", show_alert=True)
+    await show_channel_gate(update, context)
+    raise ApplicationHandlerStop
 
 
 def kb_home():
@@ -1146,6 +1242,7 @@ async def post_init(application: Application):
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(TypeHandler(Update, channel_gate), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
     app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"))
