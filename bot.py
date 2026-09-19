@@ -7,7 +7,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import (
+    Update,
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -50,52 +57,46 @@ logger.info("MENU_BANNER=%s exists=%s", MENU_BANNER, MENU_BANNER.is_file())
 
 DB_PATH = Path(os.environ.get("DB_PATH", str(BASE_DIR / "hugcollect.db")))
 
-# --- Subscription/payment settings ---
 CRYPTO_PAY_API_TOKEN = os.environ.get("CRYPTO_PAY_API_TOKEN", "").strip()
 CRYPTO_ASSET = os.environ.get("CRYPTO_ASSET", "USDT").strip().upper()
 
-# Private channels where paid subscribers get access. Set at least one pair.
 WEEKLY_CHANNEL_ID = os.environ.get("WEEKLY_CHANNEL_ID", "").strip()
 MONTHLY_CHANNEL_ID = os.environ.get("MONTHLY_CHANNEL_ID", "").strip()
-# Optional single-channel fallback.
 SUBSCRIPTION_CHANNEL_ID = os.environ.get("SUBSCRIPTION_CHANNEL_ID", "").strip()
 
 PLANS = {
-    "week": {"title": "Недельная подписка", "days": 7, "usd": "5", "stars": 400, "channel": WEEKLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID},
-    "month": {"title": "Месячная подписка", "days": 30, "usd": "9", "stars": 700, "channel": MONTHLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID},
+    "week": {
+        "title": "Недельная подписка",
+        "days": 7,
+        "usd": "5",
+        "stars": 400,
+        "channel": WEEKLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID,
+    },
+    "month": {
+        "title": "Месячная подписка",
+        "days": 30,
+        "usd": "9",
+        "stars": 700,
+        "channel": MONTHLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID,
+    },
 }
 
-# Existing CryptoBot link can be supplied as a fallback/manual payment link.
-# It is NOT enough for automatic verification; automatic CryptoBot verification requires CRYPTO_PAY_API_TOKEN.
 CRYPTO_FALLBACK_WEEK = os.environ.get("CRYPTO_FALLBACK_WEEK", "").strip()
 CRYPTO_FALLBACK_MONTH = os.environ.get("CRYPTO_FALLBACK_MONTH", "").strip()
 
-BTN_MAIN = "Главная"
-BTN_PROFILE = "Личный кабинет"
-BTN_MENU = "Меню"
-BTN_SUPPORT = "Техническая поддержка"
-BTN_BACK = "Вернуться на главную"
-BTN_PROMO = "Ввести промокод"
-BTN_SUB = "Оформить подписку"
-BTN_HUG = "Обнять юзера 🤗"
-BTN_SEARCH = "Поиск 👀"
-BTN_CHECK = "Проверить получателя"
-BTN_HISTORY = "История обнимашек"
-BTN_YES = "Да, обнять! 🤗"
-BTN_NO = "Нет, отмена"
-BTN_HOORAY = "Ура!"
-
-kb_start = ReplyKeyboardMarkup([[BTN_MAIN]], resize_keyboard=True)
-kb_home = ReplyKeyboardMarkup([[BTN_PROFILE], [BTN_MENU], [BTN_SUPPORT]], resize_keyboard=True)
-kb_profile = ReplyKeyboardMarkup([[BTN_PROMO], [BTN_SUB], [BTN_BACK]], resize_keyboard=True)
-kb_menu = ReplyKeyboardMarkup([[BTN_HUG], [BTN_SEARCH, BTN_CHECK], [BTN_HISTORY], [BTN_BACK]], resize_keyboard=True)
-kb_support = ReplyKeyboardMarkup([[BTN_BACK]], resize_keyboard=True)
-kb_confirm = ReplyKeyboardMarkup([[BTN_YES], [BTN_NO]], resize_keyboard=True)
-kb_hooray = ReplyKeyboardMarkup([[BTN_HOORAY]], resize_keyboard=True)
-
 GREETING = "Привет, обнимашка! 🤗\nЧем я могу вам помочь?"
 SUPPORT_TEXT = f"Если вы столкнулись с проблемой — напишите: {SUPPORT_USERNAME}"
-PROMO_CODES = {}  # subscriptions are disabled by default; add promo codes here if needed
+PROMO_CODES = {}
+
+HUG_STAGES = [
+    (0, "🌙 Собираем лунное тепло"),
+    (14, "✨ Наполняем объятие нежностью"),
+    (28, "🎀 Заворачиваем обнимашки"),
+    (44, "🎈 Привязываем облачко тепла"),
+    (61, "🚀 Отправляем через Hug-портал"),
+    (78, "💌 Почти у получателя"),
+    (92, "🤗 Передаём объятие"),
+]
 
 
 def db():
@@ -109,7 +110,7 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id INTEGER PRIMARY KEY,
-                level INTEGER NOT NULL DEFAULT 3,
+                level INTEGER NOT NULL DEFAULT 0,
                 warmth INTEGER NOT NULL DEFAULT 1000,
                 ref_code TEXT NOT NULL DEFAULT 'HUGGER',
                 checks INTEGER NOT NULL DEFAULT 0
@@ -156,12 +157,94 @@ def init_db():
                 PRIMARY KEY (user_id, usage_date)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payment ON subscriptions(payment_id) WHERE payment_id IS NOT NULL")
+        migrated = conn.execute("SELECT value FROM meta WHERE key='level_zero_v1'").fetchone()
+        if not migrated:
+            conn.execute("UPDATE profiles SET level=0")
+            conn.execute("INSERT INTO meta(key, value) VALUES('level_zero_v1', '1')")
         conn.commit()
+
+
+def kb_home():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Личный кабинет", callback_data="nav:profile")],
+        [InlineKeyboardButton("📋 Меню", callback_data="nav:menu")],
+        [InlineKeyboardButton("💬 Техподдержка", callback_data="nav:support")],
+    ])
+
+
+def kb_profile():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Оформить подписку", callback_data="nav:sub")],
+        [InlineKeyboardButton("🎟 Ввести промокод", callback_data="nav:promo")],
+        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+    ])
+
+
+def kb_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤗 Обнять юзера", callback_data="menu:hug")],
+        [
+            InlineKeyboardButton("👀 Поиск", callback_data="menu:search"),
+            InlineKeyboardButton("🔎 Проверить", callback_data="menu:check"),
+        ],
+        [InlineKeyboardButton("📜 История обнимашек", callback_data="menu:history")],
+        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+    ])
+
+
+def kb_back_home():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 На главную", callback_data="nav:home")]])
+
+
+def kb_confirm_hug():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, обнять! 🤗", callback_data="hug:yes")],
+        [InlineKeyboardButton("Нет, отмена", callback_data="hug:no")],
+    ])
+
+
+def kb_hooray():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Ура! 🎉", callback_data="nav:home")]])
+
+
+def kb_sub_plans():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Неделя — 5$ / 400⭐", callback_data="sub:week")],
+        [InlineKeyboardButton("Месяц — 9$ / 700⭐", callback_data="sub:month")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:home")],
+    ])
+
+
+def kb_pay_methods(plan: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🪙 CryptoBot", callback_data=f"pay:crypto:{plan}")],
+        [InlineKeyboardButton("⭐️ Telegram Stars", callback_data=f"pay:stars:{plan}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="pay:back")],
+    ])
+
+
+def kb_after_pay(link: str | None):
+    rows = []
+    if link:
+        rows.append([InlineKeyboardButton("🔐 Получить доступ к каналу", url=link)])
+    rows.append([InlineKeyboardButton("👤 Личный кабинет", callback_data="nav:profile")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
 
 
 def ensure_profile(user_id: int):
     with db() as conn:
-        conn.execute("INSERT OR IGNORE INTO profiles (user_id) VALUES (?)", (user_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO profiles (user_id, level, warmth, ref_code, checks) VALUES (?, 0, 1000, 'HUGGER', 0)",
+            (user_id,),
+        )
         conn.commit()
 
 
@@ -175,7 +258,12 @@ def get_profile(user_id: int) -> dict:
     sub = get_active_subscription(user_id)
     p["sub"] = sub
     p["sub_active"] = sub is not None
-    p["sub_days_left"] = max(0, (datetime.fromisoformat(sub["expires_at"]) - datetime.now(timezone.utc)).days) if sub else 0
+    p["sub_days_left"] = 0
+    if sub:
+        exp = datetime.fromisoformat(sub["expires_at"])
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        p["sub_days_left"] = max(0, (exp - datetime.now(timezone.utc)).days)
     return p
 
 
@@ -204,23 +292,75 @@ def create_payment(user_id: int, plan: str, method: str, external_id: str | None
         return cur.lastrowid
 
 
-def update_payment(payment_id: int, status: str):
+def update_payment(payment_id: int, status: str, external_id: str | None = None):
+    now = datetime.now(timezone.utc).isoformat()
     with db() as conn:
-        conn.execute("UPDATE payments SET status=?, updated_at=? WHERE id=?", (status, datetime.now(timezone.utc).isoformat(), payment_id))
+        if external_id:
+            conn.execute(
+                "UPDATE payments SET status=?, external_id=?, updated_at=? WHERE id=?",
+                (status, external_id, now, payment_id),
+            )
+        else:
+            conn.execute("UPDATE payments SET status=?, updated_at=? WHERE id=?", (status, now, payment_id))
         conn.commit()
+
+
+def claim_payment(payment_id: int | None, payment_key: str) -> bool:
+    """Return True if this process should notify the user (first successful claim)."""
+    if payment_key and find_subscription_by_payment(payment_key):
+        return False
+    if payment_id is None:
+        return True
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE payments SET status=?, external_id=?, updated_at=? WHERE id=? AND status!=?",
+            ("paid", payment_key, now, payment_id, "paid"),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_payment(payment_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def find_subscription_by_payment(payment_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM subscriptions WHERE payment_id=?", (payment_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def activate_subscription(user_id: int, plan: str, method: str, payment_id: str | None):
+    if payment_id:
+        existing = find_subscription_by_payment(payment_id)
+        if existing:
+            return datetime.fromisoformat(existing["expires_at"])
+
     now = datetime.now(timezone.utc)
     current = get_active_subscription(user_id)
-    start = max(now, datetime.fromisoformat(current["expires_at"])) if current else now
+    if current:
+        current_exp = datetime.fromisoformat(current["expires_at"])
+        if current_exp.tzinfo is None:
+            current_exp = current_exp.replace(tzinfo=timezone.utc)
+        start = max(now, current_exp)
+    else:
+        start = now
     expires = start + timedelta(days=PLANS[plan]["days"])
     with db() as conn:
-        conn.execute(
-            "INSERT INTO subscriptions(user_id,plan,method,payment_id,starts_at,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
-            (user_id, plan, method, payment_id, start.isoformat(), expires.isoformat(), now.isoformat()),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO subscriptions(user_id,plan,method,payment_id,starts_at,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                (user_id, plan, method, payment_id, start.isoformat(), expires.isoformat(), now.isoformat()),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            existing = find_subscription_by_payment(payment_id) if payment_id else None
+            if existing:
+                return datetime.fromisoformat(existing["expires_at"])
+            raise
     return expires
 
 
@@ -254,59 +394,135 @@ def add_check(user_id: int):
 
 def add_hug(user_id: int, target: str, count: int):
     with db() as conn:
-        conn.execute("INSERT INTO hugs(user_id,target,count,created_at) VALUES(?,?,?,?)", (user_id, target, count, datetime.now().strftime("%d.%m.%Y %H:%M")))
+        conn.execute(
+            "INSERT INTO hugs(user_id,target,count,created_at) VALUES(?,?,?,?)",
+            (user_id, target, count, datetime.now().strftime("%d.%m.%Y %H:%M")),
+        )
         conn.execute("UPDATE profiles SET warmth=MIN(1000,warmth+10) WHERE user_id=?", (user_id,))
         conn.commit()
 
 
 def get_history(user_id: int, limit=10):
     with db() as conn:
-        return conn.execute("SELECT target,count,created_at FROM hugs WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit)).fetchall()
+        return conn.execute(
+            "SELECT target,count,created_at FROM hugs WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
 
 
-async def send_profile(update: Update, profile: dict):
+def progress_bar(percent: int, width: int = 10) -> str:
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def hug_progress_text(target: str, percent: int, stage: str) -> str:
+    return (
+        "╭────────────────────╮\n"
+        "│  🤗 HugCollect     │\n"
+        "╰────────────────────╯\n\n"
+        f"Кому: {target}\n"
+        f"{stage}\n\n"
+        f"{progress_bar(percent)}  {percent}%"
+    )
+
+
+def profile_caption(profile: dict, user_id: int) -> str:
     sub_text = "Оформлена" if profile["sub_active"] else "Не оформлена"
     expires = ""
     if profile["sub"]:
-        expires = f"\n⏳ До — {datetime.fromisoformat(profile['sub']['expires_at']).strftime('%d.%m.%Y %H:%M')}"
-    caption = (
+        exp = datetime.fromisoformat(profile["sub"]["expires_at"])
+        expires = f"\n⏳ До — {exp.strftime('%d.%m.%Y %H:%M')}"
+    return (
         "👤 Личный кабинет\n\n"
         f"🤗 Уровень — {profile['level']}\n"
         f"💞 Теплота — {profile['warmth']}/1000\n"
         f"💬 Отправлено обнимашек — {profile['sent']}\n"
         f"👀 Проверок совместимости — {profile['checks']}\n\n"
         f"💎 Подписка — {sub_text}{expires}\n"
-        f"📊 Запросов сегодня — {usage_today(update.effective_user.id)}/50"
+        f"📊 Запросов сегодня — {usage_today(user_id)}/50"
     )
-    if PROFILE_BANNER.is_file():
-        try:
-            with PROFILE_BANNER.open("rb") as photo:
-                await update.message.reply_photo(photo=photo, caption=caption, reply_markup=kb_profile)
-                return
-        except Exception:
-            logger.exception("Failed to send profile banner")
-    await update.message.reply_text(caption, reply_markup=kb_profile)
 
 
-async def send_menu(update: Update):
-    if MENU_BANNER.is_file():
-        try:
-            with MENU_BANNER.open("rb") as photo:
-                await update.message.reply_photo(photo=photo, caption="Выберите действие 👇", reply_markup=kb_menu)
-                return
-        except Exception:
-            logger.exception("Failed to send menu banner")
-    await update.message.reply_text("Выберите действие 👇", reply_markup=kb_menu)
+def subscription_shop_text() -> str:
+    return (
+        "‼️ Доступ к основным функциям бота ‼️\n\n"
+        "5️⃣0️⃣ запросов в день\n"
+        "✔️ Защита пользователя\n"
+        "🔐 Доступ в закрытый канал после оплаты\n\n"
+        "1️⃣ Неделя — 5$ / 400⭐\n"
+        "2️⃣ Месяц — 9$ / 700⭐\n\n"
+        "👇 Выберите срок подписки ниже 👇"
+    )
 
 
 def subscription_required_text():
-    return "❌ Упс\n\n⭕️ У вас не имеется подписка\n\n❗️ Перейдите в личный кабинет для оформления подписки!"
+    return (
+        "❌ Упс\n\n"
+        "⭕️ У вас не имеется подписка\n\n"
+        "❗️ Оформите подписку в личном кабинете — после оплаты доступ выдастся автоматически."
+    )
 
 
-async def require_subscription(update: Update, user_id: int) -> bool:
+async def safe_delete(message: Message | None):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except TelegramError:
+        pass
+
+
+async def send_ui(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    markup: InlineKeyboardMarkup | None = None,
+    photo: Path | None = None,
+    replace: bool = True,
+):
+    chat_id = update.effective_chat.id
+    q = update.callback_query
+    if replace and q and q.message:
+        await safe_delete(q.message)
+
+    if photo and photo.is_file():
+        try:
+            with photo.open("rb") as fh:
+                await context.bot.send_photo(chat_id=chat_id, photo=fh, caption=text, reply_markup=markup)
+                return
+        except Exception:
+            logger.exception("Failed to send photo UI")
+
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+
+async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = None
+    await send_ui(update, context, GREETING, kb_home())
+
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    profile = get_profile(user_id)
+    await send_ui(update, context, profile_caption(profile, user_id), kb_profile(), photo=PROFILE_BANNER)
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_ui(update, context, "Выберите действие 👇", kb_menu(), photo=MENU_BANNER)
+
+
+async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_ui(update, context, SUPPORT_TEXT, kb_back_home())
+
+
+async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_ui(update, context, subscription_shop_text(), kb_sub_plans())
+
+
+async def require_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     if has_subscription(user_id):
         return True
-    await update.message.reply_text(subscription_required_text(), reply_markup=kb_profile)
+    await send_ui(update, context, subscription_required_text(), kb_profile())
     return False
 
 
@@ -314,17 +530,20 @@ async def issue_channel_invite(bot, user_id: int, plan: str):
     channel = PLANS[plan]["channel"]
     if not channel:
         logger.warning("No channel configured for plan=%s", plan)
-        return None
+        return None, "no_channel"
     try:
         member = await bot.get_chat_member(channel, user_id)
         if member.status in {"member", "administrator", "creator"}:
-            return None
+            return None, "already_member"
     except TelegramError:
         pass
-    expires = get_active_subscription(user_id)
+    sub = get_active_subscription(user_id)
     expire_ts = None
-    if expires:
-        expire_ts = int(datetime.fromisoformat(expires["expires_at"]).timestamp())
+    if sub:
+        exp = datetime.fromisoformat(sub["expires_at"])
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        expire_ts = int(exp.timestamp())
     try:
         link = await bot.create_chat_invite_link(
             chat_id=channel,
@@ -332,10 +551,10 @@ async def issue_channel_invite(bot, user_id: int, plan: str):
             member_limit=1,
             expire_date=expire_ts,
         )
-        return link.invite_link
+        return link.invite_link, "ok"
     except TelegramError:
         logger.exception("Could not create invite link for channel=%s user=%s", channel, user_id)
-        return None
+        return None, "error"
 
 
 async def remove_from_channels(bot, user_id: int):
@@ -346,6 +565,34 @@ async def remove_from_channels(bot, user_id: int):
             await bot.unban_chat_member(channel, user_id, only_if_banned=True)
         except TelegramError as exc:
             logger.warning("Could not remove expired user=%s from channel=%s: %s", user_id, channel, exc)
+
+
+_notified_payments: set[str] = set()
+
+
+async def grant_paid_access(bot, user_id: int, plan: str, method: str, payment_key: str, payment_db_id: int | None = None):
+    if payment_key in _notified_payments:
+        return activate_subscription(user_id, plan, method, payment_key)
+    _notified_payments.add(payment_key)
+    claim_payment(payment_db_id, payment_key)
+    expires = activate_subscription(user_id, plan, method, payment_key)
+    link, invite_status = await issue_channel_invite(bot, user_id, plan)
+    text = (
+        "✅ Оплата получена!\n\n"
+        f"💎 Подписка: {PLANS[plan]['title']}\n"
+        f"⏳ Действует до: {expires.strftime('%d.%m.%Y %H:%M')}\n"
+        "✔️ Функции бота уже открыты"
+    )
+    if invite_status == "ok" and link:
+        text += "\n\n👇 Ваша одноразовая ссылка в канал:"
+    elif invite_status == "already_member":
+        text += "\n\n🔐 Вы уже состоите в канале подписки."
+    elif invite_status == "no_channel":
+        text += "\n\nℹ️ Канал ещё настраивается администратором — доступ в боте уже активен."
+    else:
+        text += f"\n\n⚠️ Ссылку в канал не удалось создать. Напишите {SUPPORT_USERNAME} — подписка в боте уже выдана."
+    await bot.send_message(user_id, text, reply_markup=kb_after_pay(link))
+    return expires
 
 
 async def expiration_loop(application: Application):
@@ -383,30 +630,24 @@ async def create_crypto_invoice(user_id: int, plan: str):
         "asset": CRYPTO_ASSET,
         "amount": PLANS[plan]["usd"],
         "description": PLANS[plan]["title"],
-        "hidden_message": "Спасибо! Подписка будет выдана автоматически после подтверждения оплаты.",
+        "hidden_message": "Спасибо! Подписка выдана автоматически после подтверждения оплаты.",
         "payload": payload_id,
         "allow_comments": False,
         "allow_anonymous": False,
+        "expires_in": 1800,
     })
     return result, payload_id
 
 
 async def crypto_watch(application: Application, user_id: int, plan: str, payment_db_id: int, invoice_id: int):
-    for _ in range(180):  # about 30 minutes
+    for _ in range(180):
         try:
+            if find_subscription_by_payment(str(invoice_id)):
+                return
             result = await crypto_api("getInvoices", {"invoice_ids": str(invoice_id)})
             items = result.get("items", [])
             if items and items[0].get("status") == "paid":
-                update_payment(payment_db_id, "paid")
-                expires = activate_subscription(user_id, plan, "cryptobot", str(invoice_id))
-                link = await issue_channel_invite(application.bot, user_id, plan)
-                text = f"✅ Оплата получена!\n\n💎 Подписка: {PLANS[plan]['title']}\n⏳ Действует до: {expires.strftime('%d.%m.%Y %H:%M')}"
-                if link:
-                    text += "\n\n👇 Ваша ссылка для входа в канал:"
-                    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Получить доступ", url=link)]])
-                else:
-                    markup = None
-                await application.bot.send_message(user_id, text, reply_markup=markup)
+                await grant_paid_access(application.bot, user_id, plan, "cryptobot", str(invoice_id), payment_db_id)
                 return
             if items and items[0].get("status") in {"expired", "invalid"}:
                 update_payment(payment_db_id, items[0].get("status"))
@@ -417,24 +658,148 @@ async def crypto_watch(application: Application, user_id: int, plan: str, paymen
     update_payment(payment_db_id, "timeout")
 
 
-async def show_subscription(update: Update):
-    text = (
-        "‼️ Доступ к основным функциям бота ‼️\n\n"
-        "5️⃣0️⃣ запросов в день\n\n"
-        "✔️ Защита пользователя\n\n"
-        "1️⃣ Цена на неделю — 5$\n"
-        "2️⃣ Цена на месяц — 9$\n\n"
-        "⭐️ Stars ⭐️\n\n"
-        "⭐️ Неделя — 400\n"
-        "⭐️ Месяц — 700\n\n"
-        "👇 Выберите срок подписки ниже 👇"
+async def run_hug_animation(bot, chat_id: int, message_id: int, user_id: int, target: str):
+    count = random.randint(12, 48)
+    stage = HUG_STAGES[0][1]
+    try:
+        for percent in range(0, 101, 8):
+            for p, label in HUG_STAGES:
+                if percent >= p:
+                    stage = label
+            text = hug_progress_text(target, percent, stage)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            except BadRequest:
+                pass
+            await asyncio.sleep(0.32)
+        add_hug(user_id, target, count)
+        done = (
+            "╭────────────────────╮\n"
+            "│  ✅ Доставлено!    │\n"
+            "╰────────────────────╯\n\n"
+            f"🤗 Получатель: {target}\n"
+            f"💕 Обнимашек: {count}\n"
+            "🔥 +10 теплоты\n\n"
+            "Объятие успешно отправлено ✨"
+        )
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=done, reply_markup=kb_hooray())
+    except Exception:
+        logger.exception("Hug animation failed")
+        try:
+            add_hug(user_id, target, count)
+            await bot.send_message(
+                chat_id,
+                f"✅ Обнимашки отправлены {target}! 🤗\n💕 Количество: {count}",
+                reply_markup=kb_hooray(),
+            )
+        except TelegramError:
+            pass
+
+
+async def start_hug(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if not await require_subscription(update, context, user_id):
+        return
+    context.user_data["state"] = "awaiting_hug_target"
+    await send_ui(
+        update,
+        context,
+        "Введите @username или ID аккаунта, которому отправим виртуальные обнимашки 🤗",
+        kb_back_home(),
     )
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Неделя — 5$", callback_data="sub:week")],
-        [InlineKeyboardButton("Месяц — 9$", callback_data="sub:month")],
-        [InlineKeyboardButton("Главное меню", callback_data="sub:back")],
-    ])
-    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if not await require_subscription(update, context, user_id):
+        return
+    context.user_data["state"] = "awaiting_check_target"
+    await send_ui(update, context, "Введите @username для проверки:", kb_back_home())
+
+
+async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if not await require_subscription(update, context, user_id):
+        return
+    ok, _used = request_usage(user_id)
+    if not ok:
+        await send_ui(update, context, "⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", kb_menu())
+        return
+    await send_ui(update, context, "🔍 Поиск доступен по подписке.\nВведите запрос следующим сообщением — или вернитесь в меню.", kb_menu())
+
+
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    history = get_history(user_id)
+    if not history:
+        await send_ui(update, context, "Пока пусто — вы ещё никого не обнимали 🤗", kb_menu())
+        return
+    lines = "\n".join(f"• {r['target']} — {r['count']} ({r['created_at']})" for r in history)
+    await send_ui(update, context, f"📜 История обнимашек:\n\n{lines}", kb_menu())
+
+
+async def confirm_and_send_hug(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if not await require_subscription(update, context, user_id):
+        context.user_data["state"] = None
+        return
+    ok, _used = request_usage(user_id)
+    if not ok:
+        context.user_data["state"] = None
+        await send_ui(update, context, "⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", kb_menu())
+        return
+    context.user_data["state"] = None
+    target = context.user_data.get("hug_target", "другу")
+    chat_id = update.effective_chat.id
+    q = update.callback_query
+    if q and q.message:
+        try:
+            await q.message.edit_text(hug_progress_text(target, 0, HUG_STAGES[0][1]))
+            msg_id = q.message.message_id
+        except BadRequest:
+            await safe_delete(q.message)
+            msg = await context.bot.send_message(chat_id, hug_progress_text(target, 0, HUG_STAGES[0][1]))
+            msg_id = msg.message_id
+    elif update.message:
+        msg = await update.message.reply_text(hug_progress_text(target, 0, HUG_STAGES[0][1]))
+        msg_id = msg.message_id
+    else:
+        msg = await context.bot.send_message(chat_id, hug_progress_text(target, 0, HUG_STAGES[0][1]))
+        msg_id = msg.message_id
+    context.application.create_task(run_hug_animation(context.bot, chat_id, msg_id, user_id, target), update=update)
+
+
+async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    data = q.data
+    ensure_profile(user_id)
+
+    if data == "nav:home":
+        await show_home(update, context)
+    elif data == "nav:profile":
+        await show_profile(update, context)
+    elif data == "nav:menu":
+        await show_menu(update, context)
+    elif data == "nav:support":
+        await show_support(update, context)
+    elif data == "nav:promo":
+        context.user_data["state"] = None
+        await send_ui(update, context, "Промокоды сейчас отключены.", kb_profile())
+    elif data == "nav:sub":
+        await show_subscription(update, context)
+    elif data == "menu:hug":
+        await start_hug(update, context, user_id)
+    elif data == "menu:search":
+        await do_search(update, context, user_id)
+    elif data == "menu:check":
+        await start_check(update, context, user_id)
+    elif data == "menu:history":
+        await show_history(update, context, user_id)
+    elif data == "hug:yes":
+        if not context.user_data.get("hug_target"):
+            await send_ui(update, context, "Сначала выберите получателя в меню.", kb_menu())
+            return
+        await confirm_and_send_hug(update, context, user_id)
+    elif data == "hug:no":
+        context.user_data["state"] = None
+        await send_ui(update, context, "❌ Отменено.", kb_menu())
 
 
 async def subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -442,10 +807,8 @@ async def subscription_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await q.answer()
     user_id = q.from_user.id
     data = q.data
+    ensure_profile(user_id)
 
-    if data == "sub:back":
-        await q.message.edit_text(GREETING)
-        return
     if data.startswith("sub:") and data.count(":") == 1:
         plan = data.split(":")[1]
         if plan not in PLANS:
@@ -456,26 +819,20 @@ async def subscription_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"⏳ Срок — {p['days']} дней\n"
             f"💵 Цена — {p['usd']}$\n"
             f"⭐️ Stars — {p['stars']}\n\n"
+            "После оплаты подписка и доступ в канал выдаются автоматически.\n\n"
             "Выберите способ оплаты:"
         )
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("CryptoBot", callback_data=f"pay:crypto:{plan}")],
-            [InlineKeyboardButton("⭐️ Stars", callback_data=f"pay:stars:{plan}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="pay:back")],
-        ])
-        await q.message.edit_text(text, reply_markup=markup)
+        await send_ui(update, context, text, kb_pay_methods(plan))
         return
 
     if data == "pay:back":
-        await q.message.edit_text("👇 Выберите срок подписки ниже 👇", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Неделя — 5$", callback_data="sub:week")],
-            [InlineKeyboardButton("Месяц — 9$", callback_data="sub:month")],
-            [InlineKeyboardButton("Главное меню", callback_data="sub:back")],
-        ]))
+        await show_subscription(update, context)
         return
 
     if data.startswith("pay:crypto:"):
         plan = data.split(":")[-1]
+        if plan not in PLANS:
+            return
         if not CRYPTO_PAY_API_TOKEN:
             fallback = CRYPTO_FALLBACK_WEEK if plan == "week" else CRYPTO_FALLBACK_MONTH
             if fallback:
@@ -484,62 +841,123 @@ async def subscription_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     [InlineKeyboardButton("Я оплатил", callback_data=f"manual_crypto:{plan}")],
                     [InlineKeyboardButton("❌ Отменить оплату", callback_data="pay:cancel")],
                 ])
-                await q.message.edit_text("💳 Оплата через CryptoBot\n\nПосле оплаты нажмите «Я оплатил».\n⚠️ Автоматическая проверка включится после настройки CRYPTO_PAY_API_TOKEN.", reply_markup=markup)
+                await send_ui(
+                    update,
+                    context,
+                    "💳 Оплата через CryptoBot\n\nПосле оплаты нажмите «Я оплатил».\n"
+                    "⚠️ Автопроверка включится после настройки CRYPTO_PAY_API_TOKEN.",
+                    markup,
+                )
                 return
-            await q.message.edit_text("❌ CryptoBot пока не настроен. Добавьте CRYPTO_PAY_API_TOKEN в Render.")
+            await send_ui(update, context, "❌ CryptoBot пока не настроен. Добавьте CRYPTO_PAY_API_TOKEN.", kb_pay_methods(plan))
             return
         try:
-            invoice, payload_id = await create_crypto_invoice(user_id, plan)
+            invoice, _payload_id = await create_crypto_invoice(user_id, plan)
             invoice_id = int(invoice["invoice_id"])
             payment_id = create_payment(user_id, plan, "cryptobot", str(invoice_id))
+            context.user_data["pending_crypto"] = {"plan": plan, "invoice_id": invoice_id, "payment_id": payment_id}
             url = invoice.get("bot_invoice_url") or invoice.get("mini_app_invoice_url")
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Оплатить", url=url)],
+                [InlineKeyboardButton("✅ Я оплатил", callback_data=f"check_crypto:{invoice_id}:{plan}:{payment_id}")],
                 [InlineKeyboardButton("❌ Отменить оплату", callback_data="pay:cancel")],
             ])
-            await q.message.edit_text(
-                f"💳 Оплата подписки\n\n{PLANS[plan]['title']} — {PLANS[plan]['usd']}$\n\nНажмите кнопку ниже для оплаты.\nПосле успешной оплаты подписка выдастся автоматически.",
-                reply_markup=markup,
+            await send_ui(
+                update,
+                context,
+                f"💳 Оплата подписки\n\n{PLANS[plan]['title']} — {PLANS[plan]['usd']}$\n\n"
+                "Нажмите кнопку ниже для оплаты.\n"
+                "После успешной оплаты подписка и доступ выдадутся автоматически.",
+                markup,
             )
             context.application.create_task(crypto_watch(context.application, user_id, plan, payment_id, invoice_id))
         except Exception:
             logger.exception("Could not create CryptoBot invoice")
-            await q.message.edit_text("❌ Не удалось создать оплату CryptoBot. Попробуйте ещё раз или выберите Stars.")
+            await send_ui(update, context, "❌ Не удалось создать оплату CryptoBot. Попробуйте ещё раз или выберите Stars.", kb_pay_methods(plan))
         return
 
     if data.startswith("pay:stars:"):
         plan = data.split(":")[-1]
+        if plan not in PLANS:
+            return
         p = PLANS[plan]
         payment_db_id = create_payment(user_id, plan, "stars", None)
         context.user_data["pending_star_payment"] = payment_db_id
+        await safe_delete(q.message)
         try:
-            await q.message.delete()
+            await context.bot.send_invoice(
+                chat_id=user_id,
+                title=p["title"],
+                description=f"Доступ к функциям HugCollect на {p['days']} дней и вход в канал подписки.",
+                payload=f"hug:{user_id}:{plan}:{payment_db_id}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(p["title"], p["stars"])],
+            )
+            await context.bot.send_message(
+                user_id,
+                "⭐️ Оплатите счёт выше.\nПосле успешной оплаты подписка и доступ в канал выдадутся автоматически.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отменить", callback_data="pay:cancel")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:home")],
+                ]),
+            )
         except TelegramError:
-            pass
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title=p["title"],
-            description=f"Доступ к функциям HugCollect на {p['days']} дней.",
-            payload=f"hug:{user_id}:{plan}:{payment_db_id}",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice(p["title"], p["stars"])],
-        )
-        await context.bot.send_message(user_id, "⭐️ После успешной оплаты подписка будет выдана автоматически.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data="pay:cancel")]]))
+            logger.exception("Could not send Stars invoice")
+            update_payment(payment_db_id, "failed")
+            await context.bot.send_message(user_id, "❌ Не удалось создать счёт Stars. Попробуйте CryptoBot.", reply_markup=kb_pay_methods(plan))
         return
 
     if data == "pay:cancel":
-        await q.message.edit_text("❌ Оплата отменена, вы возвращены на главную.")
+        await send_ui(update, context, "❌ Оплата отменена.", kb_home())
+        return
+
+    if data.startswith("check_crypto:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        _, invoice_id, plan, payment_db_id = parts[:4]
+        if plan not in PLANS:
+            return
+        if find_subscription_by_payment(str(invoice_id)):
+            await send_ui(update, context, "✅ Эта оплата уже зачислена. Подписка активна.", kb_after_pay(None))
+            return
+        if not CRYPTO_PAY_API_TOKEN:
+            await send_ui(update, context, "⏳ Автопроверка недоступна без CRYPTO_PAY_API_TOKEN.", kb_back_home())
+            return
+        try:
+            result = await crypto_api("getInvoices", {"invoice_ids": str(invoice_id)})
+            items = result.get("items", [])
+            if items and items[0].get("status") == "paid":
+                await grant_paid_access(context.bot, user_id, plan, "cryptobot", str(invoice_id), int(payment_db_id))
+                await safe_delete(q.message)
+                return
+            await q.answer("Оплата ещё не найдена. Подождите пару секунд и нажмите снова.", show_alert=True)
+        except Exception:
+            logger.exception("Manual crypto check failed")
+            await send_ui(update, context, "❌ Не удалось проверить оплату. Попробуйте ещё раз.", kb_back_home())
         return
 
     if data.startswith("manual_crypto:"):
-        await q.message.edit_text("⏳ Если вы оплатили по ссылке CryptoBot, автоматическая проверка недоступна без API-токена. Добавьте CRYPTO_PAY_API_TOKEN в Render — тогда бот будет проверять оплату сам.")
+        await send_ui(
+            update,
+            context,
+            "⏳ Без CRYPTO_PAY_API_TOKEN бот не может сам подтвердить оплату по общей ссылке.\n"
+            "Добавьте токен в Render — тогда доступ будет выдаваться автоматически.",
+            kb_back_home(),
+        )
 
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
+    payload = query.invoice_payload or ""
+    parts = payload.split(":")
+    ok = len(parts) >= 4 and parts[0] == "hug" and parts[2] in PLANS
     try:
-        await query.answer(ok=True)
+        if ok:
+            await query.answer(ok=True)
+        else:
+            await query.answer(ok=False, error_message="Счёт недействителен. Откройте оплату заново.")
     except TelegramError:
         logger.exception("pre_checkout failed")
 
@@ -549,114 +967,73 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     payload = payment.invoice_payload
     parts = payload.split(":")
     if len(parts) < 4 or parts[0] != "hug":
+        await update.message.reply_text("❌ Не удалось распознать оплату. Напишите в поддержку.", reply_markup=kb_back_home())
         return
     _, payload_user, plan, payment_db_id = parts[:4]
     user_id = update.effective_user.id
     if str(user_id) != payload_user or plan not in PLANS:
+        await update.message.reply_text("❌ Оплата не совпала с вашим аккаунтом. Напишите в поддержку.", reply_markup=kb_back_home())
         return
-    update_payment(int(payment_db_id), "paid")
-    expires = activate_subscription(user_id, plan, "stars", payment.telegram_payment_charge_id)
-    link = await issue_channel_invite(context.bot, user_id, plan)
-    text = f"⭐️ Оплата получена!\n\n💎 {PLANS[plan]['title']}\n⏳ Действует до: {expires.strftime('%d.%m.%Y %H:%M')}"
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Получить доступ к каналу", url=link)]]) if link else None
-    await update.message.reply_text(text, reply_markup=markup)
+    charge_id = payment.telegram_payment_charge_id
+    try:
+        db_id = int(payment_db_id)
+    except ValueError:
+        db_id = context.user_data.get("pending_star_payment")
+    await grant_paid_access(context.bot, user_id, plan, "stars", charge_id, db_id)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_profile(update.effective_user.id)
     context.user_data["state"] = None
-    await update.message.reply_text(GREETING, reply_markup=kb_home)
+    await update.message.reply_text("Меню перенесено в сообщение 👇", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(GREETING, reply_markup=kb_home())
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
-    profile = get_profile(user_id)
+    ensure_profile(user_id)
     state = context.user_data.get("state")
 
     if state == "awaiting_hug_target":
         context.user_data["hug_target"] = text
         context.user_data["state"] = "awaiting_confirm"
-        await update.message.reply_text(f"Вы уверены, что хотите отправить обнимашки {text}? 🤗", reply_markup=kb_confirm)
+        await update.message.reply_text(
+            f"Вы уверены, что хотите отправить обнимашки {text}? 🤗",
+            reply_markup=kb_confirm_hug(),
+        )
         return
 
     if state == "awaiting_confirm":
-        if text == BTN_YES:
-            if not await require_subscription(update, user_id):
-                context.user_data["state"] = None
-                return
-            ok, used = request_usage(user_id)
-            if not ok:
-                context.user_data["state"] = None
-                await update.message.reply_text("⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", reply_markup=kb_menu)
-                return
-            context.user_data["state"] = None
-            target = context.user_data.get("hug_target", "другу")
-            msg = await update.message.reply_text("😴 Идёт процесс отправки обнимашек 😴\n0%", reply_markup=ReplyKeyboardRemove())
-            context.application.create_task(run_hug_animation(context.bot, update.effective_chat.id, msg.message_id, user_id, target), update=update)
-        elif text == BTN_NO:
-            context.user_data["state"] = None
-            await update.message.reply_text("❌ Отменено.", reply_markup=kb_menu)
+        await update.message.reply_text("Нажмите кнопку в сообщении выше 👆", reply_markup=kb_confirm_hug())
         return
 
     if state == "awaiting_promo":
         context.user_data["state"] = None
-        await update.message.reply_text("❌ Промокоды сейчас отключены.", reply_markup=kb_profile)
+        await update.message.reply_text("❌ Промокоды сейчас отключены.", reply_markup=kb_profile())
         return
 
     if state == "awaiting_check_target":
-        if not await require_subscription(update, user_id):
+        if not await require_subscription(update, context, user_id):
             context.user_data["state"] = None
             return
-        ok, used = request_usage(user_id)
+        ok, _used = request_usage(user_id)
         if not ok:
             context.user_data["state"] = None
-            await update.message.reply_text("⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", reply_markup=kb_menu)
+            await update.message.reply_text("⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", reply_markup=kb_menu())
             return
         context.user_data["state"] = None
         add_check(user_id)
-        await update.message.reply_text(f"🤗 Обнимашковость {text}: {random.randint(60,100)}%", reply_markup=kb_menu)
+        await update.message.reply_text(
+            f"🤗 Обнимашковость {text}: {random.randint(60, 100)}%",
+            reply_markup=kb_menu(),
+        )
         return
 
-    if text in (BTN_MAIN, BTN_BACK, BTN_HOORAY):
-        context.user_data["state"] = None
-        await update.message.reply_text(GREETING, reply_markup=kb_home)
-    elif text == BTN_PROFILE:
-        await send_profile(update, profile)
-    elif text == BTN_MENU:
-        await send_menu(update)
-    elif text == BTN_SUPPORT:
-        await update.message.reply_text(SUPPORT_TEXT, reply_markup=kb_support)
-    elif text == BTN_PROMO:
-        await update.message.reply_text("Промокоды сейчас отключены.", reply_markup=kb_profile)
-    elif text == BTN_SUB:
-        await show_subscription(update)
-    elif text == BTN_HUG:
-        if not await require_subscription(update, user_id):
-            return
-        context.user_data["state"] = "awaiting_hug_target"
-        await update.message.reply_text("Введите @username или ID аккаунта, которому отправим виртуальные обнимашки 🤗", reply_markup=ReplyKeyboardRemove())
-    elif text == BTN_SEARCH:
-        if not await require_subscription(update, user_id):
-            return
-        ok, used = request_usage(user_id)
-        if not ok:
-            await update.message.reply_text("⛔️ Лимит на сегодня исчерпан.\n\nДоступно 50 запросов в день.", reply_markup=kb_menu)
-            return
-        await update.message.reply_text("🔍 Поиск доступен по подписке. Введите запрос.", reply_markup=kb_menu)
-    elif text == BTN_CHECK:
-        if not await require_subscription(update, user_id):
-            return
-        context.user_data["state"] = "awaiting_check_target"
-        await update.message.reply_text("Введите @username для проверки:", reply_markup=ReplyKeyboardRemove())
-    elif text == BTN_HISTORY:
-        history = get_history(user_id)
-        if not history:
-            await update.message.reply_text("Пока пусто — вы ещё никого не обнимали 🤗", reply_markup=kb_menu)
-        else:
-            await update.message.reply_text("История обнимашек:\n\n" + "\n".join(f"• {r['target']} — {r['count']} ({r['created_at']})" for r in history), reply_markup=kb_menu)
-    else:
-        await update.message.reply_text("Не понимаю 🙈 Воспользуйтесь кнопками ниже.", reply_markup=kb_home)
+    await update.message.reply_text(
+        "Не понимаю 🙈 Воспользуйтесь кнопками в меню.",
+        reply_markup=kb_home(),
+    )
 
 
 async def post_init(application: Application):
@@ -667,14 +1044,21 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:)"))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
+    app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if WEBHOOK_BASE:
         webhook_path = BOT_TOKEN
-        app.run_webhook(listen="0.0.0.0", port=PORT, url_path=webhook_path, webhook_url=f"{WEBHOOK_BASE.rstrip('/')}/{webhook_path}", drop_pending_updates=True)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=webhook_path,
+            webhook_url=f"{WEBHOOK_BASE.rstrip('/')}/{webhook_path}",
+            drop_pending_updates=True,
+        )
     else:
         app.run_polling(drop_pending_updates=True)
 
