@@ -2895,7 +2895,8 @@ async def handle_text(
         ] = "awaiting_confirm"
 
         await update.message.reply_text(
-            "Вы УВЕРЕНЫ что правильно ввели @username?"{text}",
+            f"Вы уверены, что хотите "
+            f"отправить жалобы {text}?",
             reply_markup=kb_confirm_hug()
         )
 
