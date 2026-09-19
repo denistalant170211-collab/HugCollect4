@@ -154,7 +154,7 @@ CRYPTO_FALLBACK_MONTH = os.environ.get(
 ).strip()
 
 GREETING = (
-    "Привет, обнимашка! 🤗\n"
+    "Привет, пользователь!\n"
     "Чем я могу вам помочь?"
 )
 
@@ -178,15 +178,6 @@ PROMO_MAX_USES = os.environ.get(
     ""
 ).strip()
 
-HUG_STAGES = [
-    (0, "🌙 Собираем лунное тепло"),
-    (14, "✨ Наполняем объятие нежностью"),
-    (28, "🎀 Заворачиваем обнимашки"),
-    (44, "🎈 Привязываем облачко тепла"),
-    (61, "🚀 Отправляем через Hug-портал"),
-    (78, "💌 Почти у получателя"),
-    (92, "🤗 Передаём объятие"),
-]
 
 
 def db():
@@ -572,13 +563,13 @@ def kb_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🤗 Обнять юзера",
+                "sn1cти аккаунт❄️",
                 callback_data="menu:hug"
             )
         ],
         [
             InlineKeyboardButton(
-                "👀 Поиск",
+                "👀 П0иск",
                 callback_data="menu:search"
             ),
             InlineKeyboardButton(
@@ -588,7 +579,7 @@ def kb_menu():
         ],
         [
             InlineKeyboardButton(
-                "📜 История обнимашек",
+                "📜 История поиска",
                 callback_data="menu:history"
             )
         ],
@@ -616,7 +607,7 @@ def kb_confirm_hug():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "Да, обнять! 🤗",
+                "Да sn1cти аккаунт!",
                 callback_data="hug:yes"
             )
         ],
@@ -1255,7 +1246,7 @@ def hug_progress_text(
 
     return (
         "╭────────────────────╮\n"
-        "│  🤗 HugCollect     │\n"
+        "│   DarkCollect     │\n"
         "╰────────────────────╯\n\n"
         f"Кому: {target}\n"
         f"{stage}\n\n"
@@ -1289,9 +1280,9 @@ def profile_caption(
     return (
         "👤 Личный кабинет\n\n"
         f"🤗 Уровень — {profile['level']}\n"
-        f"💞 Теплота — {profile['warmth']}/1000\n"
-        f"💬 Отправлено обнимашек — {profile['sent']}\n"
-        f"👀 Проверок совместимости — {profile['checks']}\n\n"
+        f"💞 Приоритет — {profile['warmth']}/1000\n"
+        f"💬 Отправлено жалоб — {profile['sent']}\n"
+        f"👀 Всего поисков — {profile['checks']}\n\n"
         f"💎 Подписка — {sub_text}{expires}\n"
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/50"
@@ -1937,7 +1928,7 @@ async def run_hug_animation(
     # Первое сообщение.
     # Оно заменяет старое сообщение с прогрессом 0%.
     start_text = (
-        "💤Идет процесс отправления обнимашек 💤\n\n"
+        "💤Идет процесс отправления жалоб 💤\n\n"
         "3%\n\n"
         "🔰Ожидание до 1 минуты🔰"
     )
@@ -1961,9 +1952,7 @@ async def run_hug_animation(
 
         # Реальное ожидание.
         # От 10 до 60 секунд.
-        await asyncio.sleep(
-            random.randint(10, 60)
-        )
+        await asyncio.sleep(1)
 
         # Отдельные сообщения с прогрессом.
         progress_steps = [
@@ -2005,7 +1994,7 @@ async def run_hug_animation(
 
         # Финальное сообщение.
         done = (
-            f"⭕️Отправлено обнимашек — {count}⭕️"
+            f"⭕️Отправлено жалоб — 356⭕️"
         )
 
         await bot.send_message(
@@ -2055,8 +2044,7 @@ async def start_hug(
     await send_ui(
         update,
         context,
-        "Введите @username или ID аккаунта, "
-        "которому отправим виртуальные обнимашки 🤗",
+        "Введите @username или ID аккаунта который будет sнесён",
         kb_back_home()
     )
 
@@ -2131,7 +2119,7 @@ async def show_history(
             update,
             context,
             "Пока пусто — вы ещё никого "
-            "не обнимали 🤗",
+            "не искали",
             kb_menu()
         )
         return
@@ -2145,7 +2133,7 @@ async def show_history(
     await send_ui(
         update,
         context,
-        f"📜 История обнимашек:\n\n{lines}",
+        f"📜 История п0иска:\n\n{lines}",
         kb_menu()
     )
 
@@ -2907,8 +2895,7 @@ async def handle_text(
         ] = "awaiting_confirm"
 
         await update.message.reply_text(
-            f"Вы уверены, что хотите "
-            f"отправить обнимашки {text}? 🤗",
+            "Вы УВЕРЕНЫ что правильно ввели @username?"{text}",
             reply_markup=kb_confirm_hug()
         )
 
