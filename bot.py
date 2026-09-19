@@ -2118,6 +2118,10 @@ async def crypto_watch(
 # АНИМАЦИЯ ОТПРАВКИ ЖАЛОБ
 # =========================================================
 
+# =========================================================
+# АНИМАЦИЯ ОТПРАВКИ ЖАЛОБ
+# =========================================================
+
 async def run_hug_animation(
     bot,
     chat_id: int,
@@ -2125,41 +2129,14 @@ async def run_hug_animation(
     user_id: int,
     target: str
 ):
-    # Количество в финальном результате
     count = 356
 
-    # Первое сообщение
-    start_text = (
-        "💤Идет процесс отправления жалоб 💤\n\n"
-        "3%\n\n"
-        "🔰Ожидание до 1 минуты🔰"
-    )
-
     try:
-        # Пытаемся заменить сообщение
-        # с подтверждением
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=start_text
-            )
-
-        except BadRequest:
-            # Если заменить нельзя —
-            # отправляем новое сообщение
-            msg = await bot.send_message(
-                chat_id=chat_id,
-                text=start_text
-            )
-
-            message_id = msg.message_id
-
-        # Ожидание 1 секунду
+        # Первое сообщение уже было отправлено
+        # в confirm_and_send_hug()
         await asyncio.sleep(1)
 
-        # Проценты отправляются
-        # отдельными сообщениями
+        # Каждый процент отдельным сообщением
         progress_steps = [
             8,
             20,
@@ -2185,17 +2162,16 @@ async def run_hug_animation(
             text="💤100%💤"
         )
 
-        # Небольшая пауза перед результатом
         await asyncio.sleep(0.5)
 
-        # Один раз записываем результат
+        # Записываем результат в базу
         add_hug(
             user_id,
             target,
             count
         )
 
-        # Финальный результат
+        # Финальное сообщение
         await bot.send_message(
             chat_id=chat_id,
             text=f"⭕️Отправлено жалоб — {count}⭕️",
