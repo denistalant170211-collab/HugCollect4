@@ -19,15 +19,19 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    CallbackQueryHandler,
     PreCheckoutQueryHandler,
     TypeHandler,
     filters,
 )
 
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,10 +39,15 @@ logging.basicConfig(
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger("hugbot")
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# =========================================================
+# ENV
+# =========================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set")
@@ -46,8 +55,9 @@ if not BOT_TOKEN:
 
 SUPPORT_USERNAME = os.environ.get(
     "SUPPORT_USERNAME",
-    "@your_support_username"
-)
+    "@support"
+).strip()
+
 
 PORT = int(
     os.environ.get(
@@ -60,8 +70,13 @@ PORT = int(
 WEBHOOK_BASE = (
     os.environ.get("RENDER_EXTERNAL_URL")
     or os.environ.get("PUBLIC_URL")
-)
+    or ""
+).strip()
 
+
+# =========================================================
+# PATHS
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -80,7 +95,7 @@ ASSETS_DIR = next(
         for p in ASSET_CANDIDATES
         if p.is_dir()
     ),
-    ASSET_CANDIDATES[0]
+    BASE_DIR / "assets"
 )
 
 
@@ -88,34 +103,15 @@ PROFILE_BANNER = ASSETS_DIR / "profile_banner.png"
 MENU_BANNER = ASSETS_DIR / "menu_banner.png"
 
 
-logger.info(
-    "BASE_DIR=%s",
-    BASE_DIR
-)
+# =========================================================
+# DATABASE
+# =========================================================
 
-logger.info(
-    "CWD=%s",
-    Path.cwd()
-)
-
-logger.info(
-    "ASSETS_DIR=%s exists=%s",
-    ASSETS_DIR,
-    ASSETS_DIR.is_dir()
-)
-
-logger.info(
-    "PROFILE_BANNER=%s exists=%s",
-    PROFILE_BANNER,
-    PROFILE_BANNER.is_file()
-)
-
-logger.info(
-    "MENU_BANNER=%s exists=%s",
-    MENU_BANNER,
-    MENU_BANNER.is_file()
-)
-
+# На Render лучше указывать:
+# DB_PATH=/var/data/hugcollect.db
+#
+# Локально, если переменная не задана,
+# база будет рядом с этим файлом.
 
 DB_PATH = Path(
     os.environ.get(
@@ -124,6 +120,22 @@ DB_PATH = Path(
     )
 )
 
+
+DB_PATH.parent.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+logger.info(
+    "DB_PATH=%s",
+    DB_PATH
+)
+
+
+# =========================================================
+# CRYPTOBOT
+# =========================================================
 
 CRYPTO_PAY_API_TOKEN = os.environ.get(
     "CRYPTO_PAY_API_TOKEN",
@@ -136,6 +148,22 @@ CRYPTO_ASSET = os.environ.get(
     "USDT"
 ).strip().upper()
 
+
+CRYPTO_FALLBACK_WEEK = os.environ.get(
+    "CRYPTO_FALLBACK_WEEK",
+    ""
+).strip()
+
+
+CRYPTO_FALLBACK_MONTH = os.environ.get(
+    "CRYPTO_FALLBACK_MONTH",
+    ""
+).strip()
+
+
+# =========================================================
+# CHANNELS
+# =========================================================
 
 WEEKLY_CHANNEL_ID = os.environ.get(
     "WEEKLY_CHANNEL_ID",
@@ -168,11 +196,9 @@ REQUIRED_CHANNEL_URL = os.environ.get(
 ).strip()
 
 
-logger.info(
-    "REQUIRED_CHANNEL_ID=%s",
-    REQUIRED_CHANNEL_ID or "(not set)"
-)
-
+# =========================================================
+# PLANS
+# =========================================================
 
 PLANS = {
     "week": {
@@ -180,41 +206,27 @@ PLANS = {
         "days": 7,
         "usd": "5",
         "stars": 400,
-        "channel": WEEKLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID,
+        "channel": (
+            WEEKLY_CHANNEL_ID
+            or SUBSCRIPTION_CHANNEL_ID
+        ),
     },
     "month": {
         "title": "Месячная подписка",
         "days": 30,
         "usd": "9",
         "stars": 700,
-        "channel": MONTHLY_CHANNEL_ID or SUBSCRIPTION_CHANNEL_ID,
+        "channel": (
+            MONTHLY_CHANNEL_ID
+            or SUBSCRIPTION_CHANNEL_ID
+        ),
     },
 }
 
 
-CRYPTO_FALLBACK_WEEK = os.environ.get(
-    "CRYPTO_FALLBACK_WEEK",
-    ""
-).strip()
-
-
-CRYPTO_FALLBACK_MONTH = os.environ.get(
-    "CRYPTO_FALLBACK_MONTH",
-    ""
-).strip()
-
-
-GREETING = (
-    "Привет, пользователь!\n"
-    "Чем я могу вам помочь?"
-)
-
-
-SUPPORT_TEXT = (
-    f"Если вы столкнулись с проблемой — "
-    f"напишите: {SUPPORT_USERNAME}"
-)
-
+# =========================================================
+# PROMO
+# =========================================================
 
 PROMO_CODE = os.environ.get(
     "PROMO_CODE",
@@ -235,18 +247,58 @@ PROMO_MAX_USES = os.environ.get(
 
 
 # =========================================================
-# DATABASE
+# TEXTS
+# =========================================================
+
+GREETING = (
+    "Привет, пользователь!\n"
+    "Чем я могу вам помочь?"
+)
+
+
+SUPPORT_TEXT = (
+    f"Если вы столкнулись с проблемой — "
+    f"напишите: {SUPPORT_USERNAME}"
+)
+
+
+CHANNEL_GATE_TEXT = (
+    "🔒 Сначала подпишитесь на канал\n\n"
+    "Без подписки бот закрыт: меню, кабинет и "
+    "основные функции недоступны.\n\n"
+    "1️⃣ Нажмите «Подписаться»\n"
+    "2️⃣ Подпишитесь на канал\n"
+    "3️⃣ Вернитесь сюда и нажмите "
+    "«Проверить подписку»"
+)
+
+
+# =========================================================
+# DATABASE INIT
 # =========================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30
+    )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
 def init_db():
     with db() as conn:
-        conn.execute("""
+
+        conn.execute(
+            """
+            PRAGMA journal_mode=WAL
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id INTEGER PRIMARY KEY,
                 level INTEGER NOT NULL DEFAULT 0,
@@ -254,9 +306,11 @@ def init_db():
                 ref_code TEXT NOT NULL DEFAULT 'HUGGER',
                 checks INTEGER NOT NULL DEFAULT 0
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS hugs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -264,9 +318,11 @@ def init_db():
                 count INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -277,9 +333,11 @@ def init_db():
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -290,25 +348,31 @@ def init_db():
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS daily_usage (
                 user_id INTEGER NOT NULL,
                 usage_date TEXT NOT NULL,
                 requests INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, usage_date)
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS promo_codes (
                 code TEXT PRIMARY KEY,
                 plan TEXT NOT NULL,
@@ -316,40 +380,71 @@ def init_db():
                 used INTEGER NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1
             )
-        """)
+            """
+        )
 
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS promo_redemptions (
                 code TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 redeemed_at TEXT NOT NULL,
                 PRIMARY KEY (code, user_id)
             )
-        """)
+            """
+        )
 
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payment
+        # Уникальная защита от повторного использования
+        # одной и той же оплаты
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_subscriptions_payment_id
             ON subscriptions(payment_id)
             WHERE payment_id IS NOT NULL
-        """)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_payments_external_id
+            ON payments(external_id)
+            WHERE external_id IS NOT NULL
+            """
+        )
 
         migrated = conn.execute(
-            "SELECT value FROM meta WHERE key='level_zero_v1'"
+            """
+            SELECT value
+            FROM meta
+            WHERE key='level_zero_v1'
+            """
         ).fetchone()
 
         if not migrated:
             conn.execute(
-                "UPDATE profiles SET level=0"
+                """
+                UPDATE profiles
+                SET level=0
+                """
             )
 
             conn.execute(
                 """
-                INSERT INTO meta(key, value)
-                VALUES('level_zero_v1', '1')
+                INSERT OR REPLACE INTO meta(
+                    key,
+                    value
+                )
+                VALUES(
+                    'level_zero_v1',
+                    '1'
+                )
                 """
             )
 
         if PROMO_CODE:
+
             plan = (
                 PROMO_PLAN
                 if PROMO_PLAN in PLANS
@@ -364,239 +459,804 @@ def init_db():
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO promo_codes
-                (code, plan, max_uses, used, active)
-                VALUES (?, ?, ?, 0, 1)
+                INSERT OR IGNORE INTO promo_codes(
+                    code,
+                    plan,
+                    max_uses,
+                    used,
+                    active
+                )
+                VALUES(
+                    ?,
+                    ?,
+                    ?,
+                    0,
+                    1
+                )
                 """,
                 (
                     PROMO_CODE,
                     plan,
                     max_uses
-                ),
+                )
             )
 
         conn.commit()
 
 
 # =========================================================
-# REQUIRED CHANNEL
+# PROFILE
 # =========================================================
 
-def required_channel_url() -> str:
-    if REQUIRED_CHANNEL_URL:
-        return REQUIRED_CHANNEL_URL
+def ensure_profile(
+    user_id: int
+):
+    with db() as conn:
 
-    ch = REQUIRED_CHANNEL_ID.strip()
-
-    if ch.startswith("https://"):
-        return ch
-
-    if ch.startswith("@"):
-        return f"https://t.me/{ch[1:]}"
-
-    if ch.startswith("t.me/"):
-        return f"https://{ch}"
-
-    if ch and not ch.lstrip("-").isdigit():
-        return f"https://t.me/{ch}"
-
-    return ""
-
-
-def kb_channel_gate():
-    rows = []
-
-    url = required_channel_url()
-
-    if url:
-        rows.append([
-            InlineKeyboardButton(
-                "📢 Подписаться",
-                url=url
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO profiles(
+                user_id,
+                level,
+                warmth,
+                ref_code,
+                checks
             )
-        ])
-
-    rows.append([
-        InlineKeyboardButton(
-            "✅ Проверить подписку",
-            callback_data="gate:check"
+            VALUES(
+                ?,
+                0,
+                1000,
+                'HUGGER',
+                0
+            )
+            """,
+            (user_id,)
         )
-    ])
 
-    return InlineKeyboardMarkup(rows)
-
-
-CHANNEL_GATE_TEXT = (
-    "🔒 Сначала подпишитесь на канал\n\n"
-    "Без подписки бот закрыт: меню, кабинет и функции недоступны.\n\n"
-    "1️⃣ Нажмите «Подписаться»\n"
-    "2️⃣ Подпишитесь на канал\n"
-    "3️⃣ Вернитесь сюда и нажмите «Проверить подписку»"
-)
+        conn.commit()
 
 
-async def is_required_channel_member(
-    bot,
+# =========================================================
+# SUBSCRIPTION
+# =========================================================
+
+def get_active_subscription(
+    user_id: int
+):
+    """
+    ВАЖНО:
+    SQLite больше не сравнивает даты напрямую.
+
+    Мы забираем подписки пользователя,
+    а сравнение даты делаем в Python.
+    """
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    with db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM subscriptions
+            WHERE user_id=?
+            ORDER BY expires_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+
+    for row in rows:
+
+        try:
+            expires_at = datetime.fromisoformat(
+                row["expires_at"]
+            )
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if expires_at > now:
+                return dict(row)
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            continue
+
+    return None
+
+
+def has_subscription(
     user_id: int
 ) -> bool:
-
-    if not REQUIRED_CHANNEL_ID:
-        logger.warning(
-            "REQUIRED_CHANNEL_ID is not configured. "
-            "Subscription check skipped."
-        )
-        return True
-
-    try:
-        member = await bot.get_chat_member(
-            chat_id=REQUIRED_CHANNEL_ID,
-            user_id=user_id
-        )
-
-        logger.info(
-            "Subscription check: "
-            "user=%s channel=%s status=%s",
-            user_id,
-            REQUIRED_CHANNEL_ID,
-            member.status
-        )
-
-        is_member = member.status in {
-            "creator",
-            "administrator",
-            "member",
-            "restricted",
-        }
-
-        if is_member:
-            logger.info(
-                "User %s IS subscribed to channel %s",
-                user_id,
-                REQUIRED_CHANNEL_ID
-            )
-        else:
-            logger.info(
-                "User %s IS NOT subscribed to channel %s. "
-                "Status=%s",
-                user_id,
-                REQUIRED_CHANNEL_ID,
-                member.status
-            )
-
-        return is_member
-
-    except TelegramError as exc:
-        logger.error(
-            "Subscription check ERROR: "
-            "user=%s channel=%s error=%s",
-            user_id,
-            REQUIRED_CHANNEL_ID,
-            exc
-        )
-
-        return False
-
-
-async def show_channel_gate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if update.message:
-        text = update.message.text or ""
-
-        if text.startswith("/start"):
-            await update.message.reply_text(
-                "Меню перенесено в сообщение 👇",
-                reply_markup=ReplyKeyboardRemove()
-            )
-
-        await update.message.reply_text(
-            CHANNEL_GATE_TEXT,
-            reply_markup=kb_channel_gate()
-        )
-
-        return
-
-    await send_ui(
-        update,
-        context,
-        CHANNEL_GATE_TEXT,
-        kb_channel_gate()
+    return (
+        get_active_subscription(user_id)
+        is not None
     )
 
 
-async def channel_gate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not REQUIRED_CHANNEL_ID:
-        return
+# =========================================================
+# PROFILE INFO
+# =========================================================
 
-    chat = update.effective_chat
+def get_profile(
+    user_id: int
+) -> dict:
 
-    if not chat or chat.type != "private":
-        return
+    ensure_profile(
+        user_id
+    )
 
-    user = update.effective_user
+    with db() as conn:
 
-    if not user or user.is_bot:
-        return
+        row = conn.execute(
+            """
+            SELECT *
+            FROM profiles
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
 
-    if update.pre_checkout_query:
-        return
+        sent = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM hugs
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()[0]
 
-    if update.message and update.message.successful_payment:
-        return
+    profile = dict(row)
 
-    q = update.callback_query
+    profile["sent"] = sent
 
-    if q and q.data == "gate:check":
-        subscribed = await is_required_channel_member(
-            context.bot,
-            user.id
-        )
+    subscription = get_active_subscription(
+        user_id
+    )
 
-        if subscribed:
-            await q.answer(
-                "Подписка найдена ✅"
+    profile["sub"] = subscription
+    profile["sub_active"] = (
+        subscription is not None
+    )
+
+    profile["sub_days_left"] = 0
+
+    if subscription:
+
+        try:
+            expires_at = datetime.fromisoformat(
+                subscription["expires_at"]
             )
 
-            await show_home(
-                update,
-                context
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            seconds_left = (
+                expires_at
+                - datetime.now(timezone.utc)
+            ).total_seconds()
+
+            profile["sub_days_left"] = max(
+                0,
+                int(
+                    seconds_left
+                    / 86400
+                )
+            )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    return profile
+
+
+# =========================================================
+# PAYMENT DB
+# =========================================================
+
+def create_payment(
+    user_id: int,
+    plan: str,
+    method: str,
+    external_id: str | None,
+    status: str = "pending"
+) -> int:
+
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with db() as conn:
+
+        cur = conn.execute(
+            """
+            INSERT INTO payments(
+                user_id,
+                plan,
+                method,
+                external_id,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES(
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                user_id,
+                plan,
+                method,
+                external_id,
+                status,
+                now,
+                now
+            )
+        )
+
+        conn.commit()
+
+        return cur.lastrowid
+
+
+def update_payment(
+    payment_id: int,
+    status: str,
+    external_id: str | None = None
+):
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with db() as conn:
+
+        if external_id:
+
+            conn.execute(
+                """
+                UPDATE payments
+                SET status=?,
+                    external_id=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    external_id,
+                    now,
+                    payment_id
+                )
             )
 
         else:
-            await q.answer(
-                "Вы ещё не подписаны на канал.",
-                show_alert=True
+
+            conn.execute(
+                """
+                UPDATE payments
+                SET status=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    now,
+                    payment_id
+                )
             )
 
-            await show_channel_gate(
-                update,
-                context
-            )
+        conn.commit()
 
-        raise ApplicationHandlerStop
 
-    if await is_required_channel_member(
-        context.bot,
-        user.id
-    ):
-        return
+def get_payment(
+    payment_id: int
+):
+    with db() as conn:
 
-    if q:
-        await q.answer(
-            "Сначала подпишитесь на канал.",
-            show_alert=True
+        row = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE id=?
+            """,
+            (payment_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def find_subscription_by_payment(
+    payment_id: str
+):
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM subscriptions
+            WHERE payment_id=?
+            LIMIT 1
+            """,
+            (payment_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+# =========================================================
+# ACTIVATE SUBSCRIPTION
+# =========================================================
+
+def activate_subscription(
+    user_id: int,
+    plan: str,
+    method: str,
+    payment_id: str | None
+):
+    """
+    Выдаёт подписку и НЕ стирает старую.
+
+    Если у пользователя уже есть активная подписка,
+    новая подписка начинается после её окончания.
+    """
+
+    if plan not in PLANS:
+        raise ValueError(
+            f"Unknown plan: {plan}"
         )
 
-    await show_channel_gate(
-        update,
-        context
+    # Не начисляем одну и ту же оплату второй раз
+    if payment_id:
+
+        existing = find_subscription_by_payment(
+            payment_id
+        )
+
+        if existing:
+
+            expires_at = datetime.fromisoformat(
+                existing["expires_at"]
+            )
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return expires_at
+
+    now = datetime.now(
+        timezone.utc
     )
 
-    raise ApplicationHandlerStop
+    current = get_active_subscription(
+        user_id
+    )
+
+    if current:
+
+        current_exp = datetime.fromisoformat(
+            current["expires_at"]
+        )
+
+        if current_exp.tzinfo is None:
+            current_exp = current_exp.replace(
+                tzinfo=timezone.utc
+            )
+
+        starts_at = max(
+            now,
+            current_exp
+        )
+
+    else:
+
+        starts_at = now
+
+    expires_at = (
+        starts_at
+        + timedelta(
+            days=PLANS[plan]["days"]
+        )
+    )
+
+    now_iso = now.isoformat()
+
+    with db() as conn:
+
+        # Дополнительная защита от дубля оплаты
+        if payment_id:
+
+            already = conn.execute(
+                """
+                SELECT *
+                FROM subscriptions
+                WHERE payment_id=?
+                LIMIT 1
+                """,
+                (payment_id,)
+            ).fetchone()
+
+            if already:
+
+                result = datetime.fromisoformat(
+                    already["expires_at"]
+                )
+
+                if result.tzinfo is None:
+                    result = result.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                return result
+
+        conn.execute(
+            """
+            INSERT INTO subscriptions(
+                user_id,
+                plan,
+                method,
+                payment_id,
+                starts_at,
+                expires_at,
+                created_at
+            )
+            VALUES(
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                user_id,
+                plan,
+                method,
+                payment_id,
+                starts_at.isoformat(),
+                expires_at.isoformat(),
+                now_iso
+            )
+        )
+
+        conn.commit()
+
+    logger.info(
+        "SUBSCRIPTION ACTIVATED: "
+        "user=%s plan=%s method=%s expires=%s",
+        user_id,
+        plan,
+        method,
+        expires_at.isoformat()
+    )
+
+    return expires_at
+
+
+# =========================================================
+# DAILY LIMIT
+# =========================================================
+
+def request_usage(
+    user_id: int
+) -> tuple[bool, int]:
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT requests
+            FROM daily_usage
+            WHERE user_id=?
+            AND usage_date=?
+            """,
+            (
+                user_id,
+                today
+            )
+        ).fetchone()
+
+        used = (
+            int(row["requests"])
+            if row
+            else 0
+        )
+
+        if used >= 50:
+            return False, used
+
+        if row:
+
+            conn.execute(
+                """
+                UPDATE daily_usage
+                SET requests=requests+1
+                WHERE user_id=?
+                AND usage_date=?
+                """,
+                (
+                    user_id,
+                    today
+                )
+            )
+
+        else:
+
+            conn.execute(
+                """
+                INSERT INTO daily_usage(
+                    user_id,
+                    usage_date,
+                    requests
+                )
+                VALUES(
+                    ?,
+                    ?,
+                    1
+                )
+                """,
+                (
+                    user_id,
+                    today
+                )
+            )
+
+        conn.commit()
+
+    return True, used + 1
+
+
+def usage_today(
+    user_id: int
+) -> int:
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT requests
+            FROM daily_usage
+            WHERE user_id=?
+            AND usage_date=?
+            """,
+            (
+                user_id,
+                today
+            )
+        ).fetchone()
+
+    if not row:
+        return 0
+
+    return int(
+        row["requests"]
+    )
+
+
+# =========================================================
+# HUGS / CHECKS
+# =========================================================
+
+def add_check(
+    user_id: int
+):
+    with db() as conn:
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET checks=checks+1
+            WHERE user_id=?
+            """,
+            (user_id,)
+        )
+
+        conn.commit()
+
+
+def add_hug(
+    user_id: int,
+    target: str,
+    count: int
+):
+    with db() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO hugs(
+                user_id,
+                target,
+                count,
+                created_at
+            )
+            VALUES(
+                ?,
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                user_id,
+                target,
+                count,
+                datetime.now().strftime(
+                    "%d.%m.%Y %H:%M"
+                )
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET warmth=MIN(
+                1000,
+                warmth+10
+            )
+            WHERE user_id=?
+            """,
+            (user_id,)
+        )
+
+        conn.commit()
+
+
+def get_history(
+    user_id: int,
+    limit: int = 10
+):
+    with db() as conn:
+
+        return conn.execute(
+            """
+            SELECT
+                target,
+                count,
+                created_at
+            FROM hugs
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                limit
+            )
+        ).fetchall()
+
+
+# =========================================================
+# PROMO
+# =========================================================
+
+def redeem_promo(
+    user_id: int,
+    raw_code: str
+) -> tuple[str, str | None]:
+
+    code = (
+        (raw_code or "")
+        .strip()
+        .upper()
+    )
+
+    if not code:
+        return "empty", None
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code=?
+            """,
+            (code,)
+        ).fetchone()
+
+        if not row:
+            return "invalid", None
+
+        if not int(row["active"]):
+            return "invalid", None
+
+        plan = row["plan"]
+
+        if plan not in PLANS:
+            return "invalid", None
+
+        already = conn.execute(
+            """
+            SELECT 1
+            FROM promo_redemptions
+            WHERE code=?
+            AND user_id=?
+            """,
+            (
+                code,
+                user_id
+            )
+        ).fetchone()
+
+        if already:
+            return "already", None
+
+        max_uses = row["max_uses"]
+
+        if (
+            max_uses is not None
+            and int(row["used"]) >= int(max_uses)
+        ):
+            return "exhausted", None
+
+        now = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        try:
+
+            conn.execute(
+                """
+                INSERT INTO promo_redemptions(
+                    code,
+                    user_id,
+                    redeemed_at
+                )
+                VALUES(
+                    ?,
+                    ?,
+                    ?
+                )
+                """,
+                (
+                    code,
+                    user_id,
+                    now
+                )
+            )
+
+            conn.execute(
+                """
+                UPDATE promo_codes
+                SET used=used+1
+                WHERE code=?
+                """,
+                (code,)
+            )
+
+            conn.commit()
+
+        except sqlite3.IntegrityError:
+            return "already", None
+
+    return "ok", plan
 
 
 # =========================================================
@@ -744,7 +1404,9 @@ def kb_sub_plans():
     ])
 
 
-def kb_pay_methods(plan: str):
+def kb_pay_methods(
+    plan: str
+):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -767,7 +1429,9 @@ def kb_pay_methods(plan: str):
     ])
 
 
-def kb_after_pay(link: str | None):
+def kb_after_pay(
+    link: str | None
+):
     rows = []
 
     if link:
@@ -795,683 +1459,187 @@ def kb_after_pay(link: str | None):
     return InlineKeyboardMarkup(rows)
 
 
-# =========================================================
-# PROFILES
-# =========================================================
+def kb_channel_gate():
+    rows = []
 
-def ensure_profile(user_id: int):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO profiles
-            (user_id, level, warmth, ref_code, checks)
-            VALUES (?, 0, 1000, 'HUGGER', 0)
-            """,
-            (user_id,)
-        )
+    url = required_channel_url()
 
-        conn.commit()
-
-
-def get_profile(user_id: int) -> dict:
-    ensure_profile(user_id)
-
-    with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM profiles WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-
-        sent = conn.execute(
-            "SELECT COUNT(*) FROM hugs WHERE user_id=?",
-            (user_id,)
-        ).fetchone()[0]
-
-    p = dict(row)
-    p["sent"] = sent
-
-    sub = get_active_subscription(user_id)
-
-    p["sub"] = sub
-    p["sub_active"] = sub is not None
-    p["sub_days_left"] = 0
-
-    if sub:
-        exp = datetime.fromisoformat(
-            sub["expires_at"]
-        )
-
-        if exp.tzinfo is None:
-            exp = exp.replace(
-                tzinfo=timezone.utc
+    if url:
+        rows.append([
+            InlineKeyboardButton(
+                "📢 Подписаться",
+                url=url
             )
+        ])
 
-        p["sub_days_left"] = max(
-            0,
-            (exp - datetime.now(timezone.utc)).days
+    rows.append([
+        InlineKeyboardButton(
+            "✅ Проверить подписку",
+            callback_data="gate:check"
         )
+    ])
 
-    return p
-
-
-def get_active_subscription(user_id: int):
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM subscriptions
-            WHERE user_id=?
-            AND expires_at>?
-            ORDER BY expires_at DESC
-            LIMIT 1
-            """,
-            (
-                user_id,
-                now
-            )
-        ).fetchone()
-
-    return dict(row) if row else None
-
-
-def has_subscription(user_id: int) -> bool:
-    return get_active_subscription(user_id) is not None
+    return InlineKeyboardMarkup(rows)
 
 
 # =========================================================
-# PAYMENTS
+# REQUIRED CHANNEL
 # =========================================================
 
-def create_payment(
-    user_id: int,
-    plan: str,
-    method: str,
-    external_id: str | None,
-    status: str = "pending"
-) -> int:
+def required_channel_url() -> str:
 
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    if REQUIRED_CHANNEL_URL:
+        return REQUIRED_CHANNEL_URL
 
-    with db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO payments
-            (user_id, plan, method, external_id, status,
-             created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                plan,
-                method,
-                external_id,
-                status,
-                now,
-                now
-            )
+    channel = (
+        REQUIRED_CHANNEL_ID
+        .strip()
+    )
+
+    if not channel:
+        return ""
+
+    if channel.startswith(
+        "https://"
+    ):
+        return channel
+
+    if channel.startswith(
+        "t.me/"
+    ):
+        return f"https://{channel}"
+
+    if channel.startswith("@"):
+        return (
+            f"https://t.me/"
+            f"{channel[1:]}"
         )
 
-        conn.commit()
+    if channel.lstrip("-").isdigit():
+        return ""
 
-        return cur.lastrowid
-
-
-def update_payment(
-    payment_id: int,
-    status: str,
-    external_id: str | None = None
-):
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    with db() as conn:
-        if external_id:
-            conn.execute(
-                """
-                UPDATE payments
-                SET status=?, external_id=?, updated_at=?
-                WHERE id=?
-                """,
-                (
-                    status,
-                    external_id,
-                    now,
-                    payment_id
-                )
-            )
-
-        else:
-            conn.execute(
-                """
-                UPDATE payments
-                SET status=?, updated_at=?
-                WHERE id=?
-                """,
-                (
-                    status,
-                    now,
-                    payment_id
-                )
-            )
-
-        conn.commit()
+    return f"https://t.me/{channel}"
 
 
-def claim_payment(
-    payment_id: int | None,
-    payment_key: str
+async def is_required_channel_member(
+    bot,
+    user_id: int
 ) -> bool:
 
-    if (
-        payment_key
-        and find_subscription_by_payment(payment_key)
-    ):
-        return False
-
-    if payment_id is None:
+    if not REQUIRED_CHANNEL_ID:
         return True
 
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    try:
 
-    with db() as conn:
-        cur = conn.execute(
-            """
-            UPDATE payments
-            SET status=?, external_id=?, updated_at=?
-            WHERE id=? AND status!=?
-            """,
-            (
-                "paid",
-                payment_key,
-                now,
-                payment_id,
-                "paid"
-            )
+        member = await bot.get_chat_member(
+            REQUIRED_CHANNEL_ID,
+            user_id
         )
 
-        conn.commit()
+        return member.status in {
+            "creator",
+            "administrator",
+            "member",
+            "restricted",
+        }
 
-        return cur.rowcount > 0
+    except TelegramError as exc:
+
+        logger.error(
+            "Channel subscription check error: %s",
+            exc
+        )
+
+        return False
 
 
-def get_payment(payment_id: int):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM payments WHERE id=?",
-            (payment_id,)
-        ).fetchone()
-
-    return dict(row) if row else None
-
-
-def find_subscription_by_payment(
-    payment_id: str
+async def show_channel_gate(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM subscriptions
-            WHERE payment_id=?
-            """,
-            (payment_id,)
-        ).fetchone()
-
-    return dict(row) if row else None
+    await send_ui(
+        update,
+        context,
+        CHANNEL_GATE_TEXT,
+        kb_channel_gate()
+    )
 
 
-def activate_subscription(
-    user_id: int,
-    plan: str,
-    method: str,
-    payment_id: str | None
+async def channel_gate(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if payment_id:
-        existing = find_subscription_by_payment(
-            payment_id
-        )
+    """
+    Проверяет обязательную подписку на канал.
 
-        if existing:
-            return datetime.fromisoformat(
-                existing["expires_at"]
-            )
+    Не имеет никакого отношения к купленной
+    подписке в таблице subscriptions.
+    """
 
-    now = datetime.now(
-        timezone.utc
-    )
+    if not REQUIRED_CHANNEL_ID:
+        return
 
-    current = get_active_subscription(
-        user_id
-    )
+    user = update.effective_user
 
-    if current:
-        current_exp = datetime.fromisoformat(
-            current["expires_at"]
-        )
+    if not user or user.is_bot:
+        return
 
-        if current_exp.tzinfo is None:
-            current_exp = current_exp.replace(
-                tzinfo=timezone.utc
-            )
+    q = update.callback_query
 
-        start = max(
-            now,
-            current_exp
-        )
+    # Кнопка проверки подписки
+    if (
+        q
+        and q.data == "gate:check"
+    ):
 
-    else:
-        start = now
+        await q.answer()
 
-    expires = start + timedelta(
-        days=PLANS[plan]["days"]
-    )
-
-    with db() as conn:
-        try:
-            conn.execute(
-                """
-                INSERT INTO subscriptions
-                (user_id, plan, method, payment_id,
-                 starts_at, expires_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    plan,
-                    method,
-                    payment_id,
-                    start.isoformat(),
-                    expires.isoformat(),
-                    now.isoformat()
-                )
-            )
-
-            conn.commit()
-
-        except sqlite3.IntegrityError:
-            existing = (
-                find_subscription_by_payment(
-                    payment_id
-                )
-                if payment_id
-                else None
-            )
-
-            if existing:
-                return datetime.fromisoformat(
-                    existing["expires_at"]
-                )
-
-            raise
-
-    return expires
-
-
-# =========================================================
-# PROMO
-# =========================================================
-
-def redeem_promo(
-    user_id: int,
-    raw_code: str
-) -> tuple[str, str | None]:
-
-    code = (
-        (raw_code or "")
-        .strip()
-        .upper()
-    )
-
-    if not code:
-        return "empty", None
-
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM promo_codes
-            WHERE code=?
-            """,
-            (code,)
-        ).fetchone()
-
-        if not row or not int(row["active"]):
-            return "invalid", None
-
-        plan = row["plan"]
-
-        if plan not in PLANS:
-            return "invalid", None
-
-        already = conn.execute(
-            """
-            SELECT 1
-            FROM promo_redemptions
-            WHERE code=? AND user_id=?
-            """,
-            (
-                code,
-                user_id
-            )
-        ).fetchone()
-
-        if already:
-            return "already", None
-
-        max_uses = row["max_uses"]
-
-        if (
-            max_uses is not None
-            and int(row["used"]) >= int(max_uses)
+        if await is_required_channel_member(
+            context.bot,
+            user.id
         ):
-            return "exhausted", None
-
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        try:
-            conn.execute(
-                """
-                INSERT INTO promo_redemptions
-                (code, user_id, redeemed_at)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    code,
-                    user_id,
-                    now
-                )
-            )
-
-            conn.execute(
-                """
-                UPDATE promo_codes
-                SET used=used+1
-                WHERE code=?
-                """,
-                (code,)
-            )
-
-            conn.commit()
-
-        except sqlite3.IntegrityError:
-            return "already", None
-
-    return "ok", plan
-
-
-# =========================================================
-# DAILY USAGE
-# =========================================================
-
-def request_usage(
-    user_id: int
-) -> tuple[bool, int]:
-
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
-
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT requests
-            FROM daily_usage
-            WHERE user_id=? AND usage_date=?
-            """,
-            (
-                user_id,
-                today
-            )
-        ).fetchone()
-
-        used = (
-            int(row[0])
-            if row
-            else 0
-        )
-
-        if used >= 50:
-            return False, used
-
-        if row:
-            conn.execute(
-                """
-                UPDATE daily_usage
-                SET requests=requests+1
-                WHERE user_id=? AND usage_date=?
-                """,
-                (
-                    user_id,
-                    today
-                )
+            await show_home(
+                update,
+                context
             )
 
         else:
-            conn.execute(
-                """
-                INSERT INTO daily_usage
-                (user_id, usage_date, requests)
-                VALUES (?, ?, 1)
-                """,
-                (
-                    user_id,
-                    today
-                )
+
+            await q.answer(
+                "Вы ещё не подписались.",
+                show_alert=True
             )
 
-        conn.commit()
-
-        return True, used + 1
-
-
-def usage_today(
-    user_id: int
-) -> int:
-
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
-
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT requests
-            FROM daily_usage
-            WHERE user_id=? AND usage_date=?
-            """,
-            (
-                user_id,
-                today
+            await show_channel_gate(
+                update,
+                context
             )
-        ).fetchone()
 
-    return int(row[0]) if row else 0
+        raise ApplicationHandlerStop
 
+    # Не блокируем pre_checkout
+    if update.pre_checkout_query:
+        return
 
-# =========================================================
-# PROFILE ACTIONS
-# =========================================================
+    # Не блокируем successful_payment
+    if (
+        update.message
+        and update.message.successful_payment
+    ):
+        return
 
-def add_check(
-    user_id: int
-):
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE profiles
-            SET checks=checks+1
-            WHERE user_id=?
-            """,
-            (user_id,)
-        )
+    if await is_required_channel_member(
+        context.bot,
+        user.id
+    ):
+        return
 
-        conn.commit()
-
-
-def add_hug(
-    user_id: int,
-    target: str,
-    count: int
-):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO hugs
-            (user_id, target, count, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                target,
-                count,
-                datetime.now().strftime(
-                    "%d.%m.%Y %H:%M"
-                )
-            )
-        )
-
-        conn.execute(
-            """
-            UPDATE profiles
-            SET warmth=MIN(1000, warmth+10)
-            WHERE user_id=?
-            """,
-            (user_id,)
-        )
-
-        conn.commit()
-
-
-def get_history(
-    user_id: int,
-    limit=10
-):
-    with db() as conn:
-        return conn.execute(
-            """
-            SELECT target, count, created_at
-            FROM hugs
-            WHERE user_id=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (
-                user_id,
-                limit
-            )
-        ).fetchall()
-
-
-# =========================================================
-# PROGRESS UI
-# =========================================================
-
-def progress_bar(
-    percent: int,
-    width: int = 10
-) -> str:
-
-    filled = max(
-        0,
-        min(
-            width,
-            round(
-                percent / 100 * width
-            )
-        )
+    await show_channel_gate(
+        update,
+        context
     )
 
-    return (
-        "█" * filled
-        + "░" * (width - filled)
-    )
-
-
-def hug_progress_text(
-    target: str,
-    percent: int,
-    stage: str
-) -> str:
-
-    return (
-        "╭────────────────────╮\n"
-        "│   DarkCollect     │\n"
-        "╰────────────────────╯\n\n"
-        f"Кому: {target}\n"
-        f"{stage}\n\n"
-        f"{progress_bar(percent)}  {percent}%"
-    )
-
-
-# =========================================================
-# PROFILE TEXT
-# =========================================================
-
-def profile_caption(
-    profile: dict,
-    user_id: int
-) -> str:
-
-    sub_text = (
-        "Оформлена"
-        if profile["sub_active"]
-        else "Не оформлена"
-    )
-
-    expires = ""
-
-    if profile["sub"]:
-        exp = datetime.fromisoformat(
-            profile["sub"]["expires_at"]
-        )
-
-        expires = (
-            f"\n⏳ До — "
-            f"{exp.strftime('%d.%m.%Y %H:%M')}"
-        )
-
-    return (
-        "👤 Личный кабинет\n\n"
-        f"🤗 Уровень — {profile['level']}\n"
-        f"💞 Приоритет — {profile['warmth']}/1000\n"
-        f"💬 Отправлено жалоб — {profile['sent']}\n"
-        f"👀 Всего поисков — {profile['checks']}\n\n"
-        f"💎 Подписка — {sub_text}{expires}\n"
-        f"📊 Запросов сегодня — "
-        f"{usage_today(user_id)}/50"
-    )
-
-
-def subscription_shop_text() -> str:
-    return (
-        "‼️ Доступ к основным функциям бота ‼️\n\n"
-        "5️⃣0️⃣ запросов в день\n"
-        "✔️ Защита пользователя\n"
-        "🔐 Доступ в закрытый канал после оплаты\n\n"
-        "1️⃣ Неделя — 5$ / 400⭐\n"
-        "2️⃣ Месяц — 9$ / 700⭐\n\n"
-        "👇 Выберите срок подписки ниже 👇"
-    )
-
-
-def subscription_required_text():
-    return (
-        "❌ Упс\n\n"
-        "⭕️ У вас не имеется подписка\n\n"
-        "❗️ Оформите подписку в личном кабинете — "
-        "после оплаты доступ выдастся автоматически."
-    )
+    raise ApplicationHandlerStop
 
 
 # =========================================================
@@ -1485,6 +1653,7 @@ async def safe_delete(
         return
 
     try:
+
         await message.delete()
 
     except TelegramError:
@@ -1497,7 +1666,7 @@ async def send_ui(
     text: str,
     markup: InlineKeyboardMarkup | None = None,
     photo: Path | None = None,
-    replace: bool = True,
+    replace: bool = True
 ):
     chat_id = update.effective_chat.id
     q = update.callback_query
@@ -1507,14 +1676,19 @@ async def send_ui(
         and q
         and q.message
     ):
-        await safe_delete(q.message)
+        await safe_delete(
+            q.message
+        )
 
     if (
         photo
         and photo.is_file()
     ):
+
         try:
+
             with photo.open("rb") as fh:
+
                 await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=fh,
@@ -1526,7 +1700,7 @@ async def send_ui(
 
         except Exception:
             logger.exception(
-                "Failed to send photo UI"
+                "Failed to send photo"
             )
 
     await context.bot.send_message(
@@ -1597,6 +1771,17 @@ async def show_support(
     )
 
 
+def subscription_shop_text() -> str:
+    return (
+        "‼️ Доступ к основным функциям бота ‼️\n\n"
+        "5️⃣0️⃣ запросов в день\n"
+        "✔️ Защита пользователя\n\n"
+        "1️⃣ Цена на неделю — 5$ / 400⭐\n"
+        "2️⃣ Цена на месяц — 9$ / 700⭐\n\n"
+        "👇 Выберите срок подписки ниже 👇"
+    )
+
+
 async def show_subscription(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -1615,13 +1800,19 @@ async def require_subscription(
     user_id: int
 ) -> bool:
 
-    if has_subscription(user_id):
+    if has_subscription(
+        user_id
+    ):
         return True
 
     await send_ui(
         update,
         context,
-        subscription_required_text(),
+        (
+            "❌ Упс\n\n"
+            "⭕️ У вас не имеется подписка\n\n"
+            "❗️ Оформите подписку в личном кабинете."
+        ),
         kb_profile()
     )
 
@@ -1629,497 +1820,65 @@ async def require_subscription(
 
 
 # =========================================================
-# CHANNEL ACCESS
+# PROFILE TEXT
 # =========================================================
 
-async def issue_channel_invite(
-    bot,
-    user_id: int,
-    plan: str
-):
-    channel = PLANS[plan]["channel"]
-
-    if not channel:
-        logger.warning(
-            "No channel configured for plan=%s",
-            plan
-        )
-
-        return None, "no_channel"
-
-    try:
-        member = await bot.get_chat_member(
-            channel,
-            user_id
-        )
-
-        if member.status in {
-            "member",
-            "administrator",
-            "creator"
-        }:
-            return None, "already_member"
-
-    except TelegramError:
-        pass
-
-    sub = get_active_subscription(
-        user_id
-    )
-
-    expire_ts = None
-
-    if sub:
-        exp = datetime.fromisoformat(
-            sub["expires_at"]
-        )
-
-        if exp.tzinfo is None:
-            exp = exp.replace(
-                tzinfo=timezone.utc
-            )
-
-        expire_ts = int(
-            exp.timestamp()
-        )
-
-    try:
-        link = await bot.create_chat_invite_link(
-            chat_id=channel,
-            name=f"user {user_id} {plan}",
-            member_limit=1,
-            expire_date=expire_ts
-        )
-
-        return link.invite_link, "ok"
-
-    except TelegramError:
-        logger.exception(
-            "Could not create invite link "
-            "for channel=%s user=%s",
-            channel,
-            user_id
-        )
-
-        return None, "error"
-
-
-async def remove_from_channels(
-    bot,
+def profile_caption(
+    profile: dict,
     user_id: int
-):
-    channels = {
-        p["channel"]
-        for p in PLANS.values()
-        if p["channel"]
-    }
-
-    for channel in channels:
-        try:
-            await bot.ban_chat_member(
-                channel,
-                user_id
-            )
-
-            await bot.unban_chat_member(
-                channel,
-                user_id,
-                only_if_banned=True
-            )
-
-        except TelegramError as exc:
-            logger.warning(
-                "Could not remove expired "
-                "user=%s from channel=%s: %s",
-                user_id,
-                channel,
-                exc
-            )
-
-
-_notified_payments: set[str] = set()
-
-
-def _access_granted_text(
-    plan: str,
-    expires: datetime,
-    invite_status: str,
-    header: str,
-    link: str | None = None
 ) -> str:
 
-    if expires.tzinfo is None:
-        expires = expires.replace(
-            tzinfo=timezone.utc
-        )
-
-    text = (
-        f"{header}\n\n"
-        f"💎 Подписка: {PLANS[plan]['title']}\n"
-        f"⏳ Действует до: "
-        f"{expires.strftime('%d.%m.%Y %H:%M')}\n"
-        "✔️ Функции бота уже открыты"
-    )
-
-    if (
-        invite_status == "ok"
-        and link
-    ):
-        text += (
-            "\n\n👇 Ваша одноразовая ссылка в канал:"
-        )
-
-    elif invite_status == "already_member":
-        text += (
-            "\n\n🔐 Вы уже состоите "
-            "в канале подписки."
-        )
-
-    elif invite_status == "no_channel":
-        text += (
-            "\n\nℹ️ Канал ещё настраивается "
-            "администратором — доступ в боте уже активен."
-        )
-
+    if profile["sub_active"]:
+        sub_text = "✅ Активна"
     else:
-        text += (
-            f"\n\n⚠️ Ссылку в канал не удалось создать. "
-            f"Напишите {SUPPORT_USERNAME} — "
-            "подписка в боте уже выдана."
-        )
+        sub_text = "❌ Не оформлена"
 
-    return text
+    expires_text = ""
 
+    if profile["sub"]:
 
-async def grant_paid_access(
-    bot,
-    user_id: int,
-    plan: str,
-    method: str,
-    payment_key: str,
-    payment_db_id: int | None = None
-):
-    if payment_key in _notified_payments:
-        return activate_subscription(
-            user_id,
-            plan,
-            method,
-            payment_key
-        )
-
-    _notified_payments.add(
-        payment_key
-    )
-
-    claim_payment(
-        payment_db_id,
-        payment_key
-    )
-
-    expires = activate_subscription(
-        user_id,
-        plan,
-        method,
-        payment_key
-    )
-
-    link, invite_status = await issue_channel_invite(
-        bot,
-        user_id,
-        plan
-    )
-
-    await bot.send_message(
-        user_id,
-        _access_granted_text(
-            plan,
-            expires,
-            invite_status,
-            "✅ Оплата получена!",
-            link
-        ),
-        reply_markup=kb_after_pay(link)
-    )
-
-    return expires
-
-
-async def grant_promo_access(
-    bot,
-    user_id: int,
-    plan: str,
-    code: str
-):
-    payment_key = (
-        f"promo:{code}:{user_id}"
-    )
-
-    expires = activate_subscription(
-        user_id,
-        plan,
-        "promo",
-        payment_key
-    )
-
-    link, invite_status = await issue_channel_invite(
-        bot,
-        user_id,
-        plan
-    )
-
-    await bot.send_message(
-        user_id,
-        _access_granted_text(
-            plan,
-            expires,
-            invite_status,
-            f"✅ Промокод {code} активирован!",
-            link
-        ),
-        reply_markup=kb_after_pay(link)
-    )
-
-    return expires
-
-
-async def apply_promo_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    raw_code: str
-) -> bool:
-
-    status, plan = redeem_promo(
-        user_id,
-        raw_code
-    )
-
-    if status == "empty":
-        await update.effective_message.reply_text(
-            "Введите промокод текстом.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    if status == "invalid":
-        return False
-
-    if status == "already":
-        await update.effective_message.reply_text(
-            "❌ Вы уже использовали этот промокод.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    if status == "exhausted":
-        await update.effective_message.reply_text(
-            "❌ Этот промокод больше недоступен.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    await grant_promo_access(
-        context.bot,
-        user_id,
-        plan,
-        (raw_code or "").strip().upper()
-    )
-
-    return True
-
-
-# =========================================================
-# EXPIRATION
-# =========================================================
-
-async def expiration_loop(
-    application: Application
-):
-    while True:
         try:
-            now = datetime.now(
-                timezone.utc
-            ).isoformat()
 
-            with db() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT user_id
-                    FROM subscriptions
-                    WHERE expires_at<=?
-                    """,
-                    (now,)
-                ).fetchall()
-
-            for row in rows:
-                if not has_subscription(
-                    row["user_id"]
-                ):
-                    await remove_from_channels(
-                        application.bot,
-                        row["user_id"]
-                    )
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-            logger.exception(
-                "Expiration loop failed"
+            expires_at = datetime.fromisoformat(
+                profile["sub"]["expires_at"]
             )
 
-        await asyncio.sleep(60)
-
-
-# =========================================================
-# CRYPTOBOT
-# =========================================================
-
-async def crypto_api(
-    method: str,
-    payload: dict
-):
-    if not CRYPTO_PAY_API_TOKEN:
-        raise RuntimeError(
-            "CRYPTO_PAY_API_TOKEN is not configured"
-        )
-
-    headers = {
-        "Crypto-Pay-API-Token":
-            CRYPTO_PAY_API_TOKEN
-    }
-
-    async with httpx.AsyncClient(
-        timeout=15
-    ) as client:
-
-        r = await client.post(
-            f"https://pay.crypt.bot/api/{method}",
-            json=payload,
-            headers=headers
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-
-        if not data.get("ok"):
-            raise RuntimeError(
-                data.get("error", {}).get(
-                    "name",
-                    "Crypto Pay API error"
-                )
-            )
-
-        return data["result"]
-
-
-async def create_crypto_invoice(
-    user_id: int,
-    plan: str
-):
-    payload_id = (
-        f"hug:{user_id}:{plan}:"
-        f"{int(datetime.now(timezone.utc).timestamp())}"
-    )
-
-    result = await crypto_api(
-        "createInvoice",
-        {
-            "asset": CRYPTO_ASSET,
-            "amount": PLANS[plan]["usd"],
-            "description": PLANS[plan]["title"],
-            "hidden_message":
-                "Спасибо! Подписка выдана "
-                "автоматически после подтверждения оплаты.",
-            "payload": payload_id,
-            "allow_comments": False,
-            "allow_anonymous": False,
-            "expires_in": 1800,
-        }
-    )
-
-    return result, payload_id
-
-
-async def crypto_watch(
-    application: Application,
-    user_id: int,
-    plan: str,
-    payment_db_id: int,
-    invoice_id: int
-):
-    for _ in range(180):
-        try:
-            if find_subscription_by_payment(
-                str(invoice_id)
-            ):
-                return
-
-            result = await crypto_api(
-                "getInvoices",
-                {
-                    "invoice_ids":
-                        str(invoice_id)
-                }
-            )
-
-            items = result.get(
-                "items",
-                []
-            )
-
-            if (
-                items
-                and items[0].get("status") == "paid"
-            ):
-                await grant_paid_access(
-                    application.bot,
-                    user_id,
-                    plan,
-                    "cryptobot",
-                    str(invoice_id),
-                    payment_db_id
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
                 )
 
-                return
-
-            if (
-                items
-                and items[0].get("status")
-                in {"expired", "invalid"}
-            ):
-                update_payment(
-                    payment_db_id,
-                    items[0].get("status")
-                )
-
-                return
-
-        except Exception:
-            logger.exception(
-                "Crypto payment check failed: "
-                "invoice=%s",
-                invoice_id
+            expires_text = (
+                "\n⏳ До: "
+                f"{expires_at.strftime('%d.%m.%Y %H:%M')}"
             )
 
-        await asyncio.sleep(10)
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
 
-    update_payment(
-        payment_db_id,
-        "timeout"
+    return (
+        "👤 Личный кабинет\n\n"
+        f"🤗 Уровень — "
+        f"{profile['level']}\n"
+        f"💞 Приоритет — "
+        f"{profile['warmth']}/1000\n"
+        f"💬 Отправлено жалоб — "
+        f"{profile['sent']}\n"
+        f"👀 Всего поисков — "
+        f"{profile['checks']}\n\n"
+        f"💎 Подписка — "
+        f"{sub_text}"
+        f"{expires_text}\n"
+        f"📊 Запросов сегодня — "
+        f"{usage_today(user_id)}/50"
     )
 
 
 # =========================================================
-# АНИМАЦИЯ ОТПРАВКИ ЖАЛОБ
-# =========================================================
-
-# =========================================================
-# АНИМАЦИЯ ОТПРАВКИ ЖАЛОБ
+# HUG PROCESS
 # =========================================================
 
 async def run_hug_animation(
@@ -2129,14 +1888,21 @@ async def run_hug_animation(
     user_id: int,
     target: str
 ):
+    """
+    Первое сообщение уже отправляет
+    confirm_and_send_hug().
+
+    Поэтому здесь НЕ пытаемся повторно
+    редактировать его.
+    """
+
     count = 356
 
     try:
-        # Первое сообщение уже было отправлено
-        # в confirm_and_send_hug()
+
+        # Первая пауза
         await asyncio.sleep(1)
 
-        # Каждый процент отдельным сообщением
         progress_steps = [
             8,
             20,
@@ -2148,12 +1914,12 @@ async def run_hug_animation(
         ]
 
         for percent in progress_steps:
+
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"💤{percent}%💤"
             )
 
-            # Ровно 1 секунда между сообщениями
             await asyncio.sleep(1)
 
         # 100%
@@ -2164,29 +1930,29 @@ async def run_hug_animation(
 
         await asyncio.sleep(0.5)
 
-        # Записываем результат в базу
+        # Сохраняем один результат
         add_hug(
             user_id,
             target,
             count
         )
 
-        # Финальное сообщение
+        # Финал
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⭕️Отправлено жалоб — {count}⭕️",
+            text=(
+                f"⭕️Отправлено жалоб — "
+                f"{count}⭕️"
+            ),
             reply_markup=kb_hooray()
         )
 
     except Exception:
+
         logger.exception(
             "Hug animation failed"
         )
 
-
-# =========================================================
-# HUG
-# =========================================================
 
 async def start_hug(
     update: Update,
@@ -2200,14 +1966,17 @@ async def start_hug(
     ):
         return
 
-    context.user_data["state"] = (
-        "awaiting_hug_target"
-    )
+    context.user_data[
+        "state"
+    ] = "awaiting_hug_target"
 
     await send_ui(
         update,
         context,
-        "Введите @username или ID аккаунта который будет sнесён",
+        (
+            "Введите @username или ID аккаунта "
+            "который будет sнесён"
+        ),
         kb_back_home()
     )
 
@@ -2222,7 +1991,10 @@ async def confirm_and_send_hug(
         context,
         user_id
     ):
-        context.user_data["state"] = None
+        context.user_data[
+            "state"
+        ] = None
+
         return
 
     ok, _used = request_usage(
@@ -2230,49 +2002,61 @@ async def confirm_and_send_hug(
     )
 
     if not ok:
-        context.user_data["state"] = None
+
+        context.user_data[
+            "state"
+        ] = None
 
         await send_ui(
             update,
             context,
-            "⛔️ Лимит на сегодня исчерпан.\n\n"
-            "Доступно 50 запросов в день.",
+            (
+                "⛔️ Лимит на сегодня исчерпан.\n\n"
+                "Доступно 50 запросов в день."
+            ),
             kb_menu()
         )
 
         return
 
-    context.user_data["state"] = None
+    context.user_data[
+        "state"
+    ] = None
 
     target = context.user_data.get(
         "hug_target",
         "другу"
     )
 
-    chat_id = update.effective_chat.id
-    q = update.callback_query
-
-    # Первое сообщение
     initial_text = (
         "💤Идет процесс отправления жалоб 💤\n\n"
         "3%\n\n"
         "🔰Ожидание до 1 минуты🔰"
     )
 
-    # Если запуск произошёл через кнопку
-    if q and q.message:
+    chat_id = update.effective_chat.id
+    q = update.callback_query
+
+    # Нажатие кнопки подтверждения
+    if (
+        q
+        and q.message
+    ):
+
         try:
+
             await q.message.edit_text(
                 initial_text
             )
 
-            msg_id = q.message.message_id
-
-        except BadRequest:
-            await safe_delete(
-                q.message
+            msg_id = (
+                q.message.message_id
             )
 
+        except BadRequest:
+
+            # Если сообщение нельзя изменить
+            # отправляем новое
             msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=initial_text
@@ -2280,16 +2064,16 @@ async def confirm_and_send_hug(
 
             msg_id = msg.message_id
 
-    # Если запуск через обычное сообщение
     elif update.message:
+
         msg = await update.message.reply_text(
             initial_text
         )
 
         msg_id = msg.message_id
 
-    # Запасной вариант
     else:
+
         msg = await context.bot.send_message(
             chat_id=chat_id,
             text=initial_text
@@ -2297,7 +2081,8 @@ async def confirm_and_send_hug(
 
         msg_id = msg.message_id
 
-    # Запускаем процесс отдельно
+    # ВАЖНО:
+    # дальше процесс идёт отдельно
     context.application.create_task(
         run_hug_animation(
             context.bot,
@@ -2326,15 +2111,57 @@ async def start_check(
     ):
         return
 
-    context.user_data["state"] = (
-        "awaiting_check_target"
-    )
+    context.user_data[
+        "state"
+    ] = "awaiting_check_target"
 
     await send_ui(
         update,
         context,
         "Введите @username для проверки:",
         kb_back_home()
+    )
+
+
+async def do_check(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    target: str
+):
+    if not await require_subscription(
+        update,
+        context,
+        user_id
+    ):
+        return
+
+    ok, _used = request_usage(
+        user_id
+    )
+
+    if not ok:
+
+        await update.message.reply_text(
+            (
+                "⛔️ Лимит на сегодня исчерпан.\n\n"
+                "Доступно 50 запросов в день."
+            ),
+            reply_markup=kb_menu()
+        )
+
+        return
+
+    add_check(
+        user_id
+    )
+
+    await update.message.reply_text(
+        f"🔎 Результат проверки {target}\n\n"
+        f"🤗 Обнимашковость — "
+        f"{random.randint(60, 100)}%\n\n"
+        "✅ Проверка завершена.",
+        reply_markup=kb_menu()
     )
 
 
@@ -2354,30 +2181,21 @@ async def do_search(
     ):
         return
 
-    ok, _used = request_usage(
-        user_id
-    )
-
-    if not ok:
-        await send_ui(
-            update,
-            context,
-            "⛔️ Лимит на сегодня исчерпан.\n\n"
-            "Доступно 50 запросов в день.",
-            kb_menu()
-        )
-
-        return
+    context.user_data[
+        "state"
+    ] = "awaiting_search"
 
     await send_ui(
         update,
         context,
-        "🔍 Поиск доступен по подписке.\n"
-        "Введите запрос следующим сообщением — "
-        "или вернитесь в меню.",
+        "Введите запрос для поиска:",
         kb_menu()
     )
 
+
+# =========================================================
+# HISTORY
+# =========================================================
 
 async def show_history(
     update: Update,
@@ -2389,32 +2207,44 @@ async def show_history(
     )
 
     if not history:
+
         await send_ui(
             update,
             context,
-            "Пока пусто — вы ещё никого "
-            "не искали",
+            (
+                "📜 История пуста.\n\n"
+                "Вы ещё ничего не искали."
+            ),
             kb_menu()
         )
 
         return
 
-    lines = "\n".join(
-        f"• {r['target']} — "
-        f"{r['count']} ({r['created_at']})"
-        for r in history
+    lines = []
+
+    for row in history:
+
+        lines.append(
+            f"• {row['target']} — "
+            f"{row['count']} "
+            f"({row['created_at']})"
+        )
+
+    text = (
+        "📜 История п0иска:\n\n"
+        + "\n".join(lines)
     )
 
     await send_ui(
         update,
         context,
-        f"📜 История п0иска:\n\n{lines}",
+        text,
         kb_menu()
     )
 
 
 # =========================================================
-# NAVIGATION CALLBACKS
+# NAV CALLBACK
 # =========================================================
 
 async def nav_callback(
@@ -2423,8 +2253,6 @@ async def nav_callback(
 ):
     q = update.callback_query
 
-    await q.answer()
-
     user_id = q.from_user.id
     data = q.data
 
@@ -2432,86 +2260,125 @@ async def nav_callback(
         user_id
     )
 
+    try:
+        await q.answer()
+
+    except TelegramError:
+        pass
+
     if data == "nav:home":
+
         await show_home(
             update,
             context
         )
 
-    elif data == "nav:profile":
+        return
+
+    if data == "nav:profile":
+
         await show_profile(
             update,
             context
         )
 
-    elif data == "nav:menu":
+        return
+
+    if data == "nav:menu":
+
         await show_menu(
             update,
             context
         )
 
-    elif data == "nav:support":
+        return
+
+    if data == "nav:support":
+
         await show_support(
             update,
             context
         )
 
-    elif data == "nav:promo":
-        context.user_data["state"] = (
-            "awaiting_promo"
-        )
+        return
 
-        await send_ui(
-            update,
-            context,
-            "🎟 Введите промокод "
-            "следующим сообщением:",
-            kb_profile()
-        )
+    if data == "nav:sub":
 
-    elif data == "nav:sub":
         await show_subscription(
             update,
             context
         )
 
-    elif data == "menu:hug":
+        return
+
+    if data == "nav:promo":
+
+        context.user_data[
+            "state"
+        ] = "awaiting_promo"
+
+        await send_ui(
+            update,
+            context,
+            "🎟 Введите промокод:",
+            kb_profile()
+        )
+
+        return
+
+    if data == "menu:hug":
+
         await start_hug(
             update,
             context,
             user_id
         )
 
-    elif data == "menu:search":
+        return
+
+    if data == "menu:search":
+
         await do_search(
             update,
             context,
             user_id
         )
 
-    elif data == "menu:check":
+        return
+
+    if data == "menu:check":
+
         await start_check(
             update,
             context,
             user_id
         )
 
-    elif data == "menu:history":
+        return
+
+    if data == "menu:history":
+
         await show_history(
             update,
             context,
             user_id
         )
 
-    elif data == "hug:yes":
+        return
+
+    if data == "hug:yes":
+
         if not context.user_data.get(
             "hug_target"
         ):
+
             await send_ui(
                 update,
                 context,
-                "Сначала выберите "
-                "получателя в меню.",
+                (
+                    "❌ Получатель не выбран.\n\n"
+                    "Сначала введите аккаунт."
+                ),
                 kb_menu()
             )
 
@@ -2523,8 +2390,18 @@ async def nav_callback(
             user_id
         )
 
-    elif data == "hug:no":
-        context.user_data["state"] = None
+        return
+
+    if data == "hug:no":
+
+        context.user_data[
+            "state"
+        ] = None
+
+        context.user_data.pop(
+            "hug_target",
+            None
+        )
 
         await send_ui(
             update,
@@ -2535,7 +2412,7 @@ async def nav_callback(
 
 
 # =========================================================
-# SUBSCRIPTIONS CALLBACKS
+# SUB CALLBACK
 # =========================================================
 
 async def subscription_callback(
@@ -2544,7 +2421,10 @@ async def subscription_callback(
 ):
     q = update.callback_query
 
-    await q.answer()
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
 
     user_id = q.from_user.id
     data = q.data
@@ -2553,11 +2433,15 @@ async def subscription_callback(
         user_id
     )
 
-    # Выбор тарифа
+    # -------------------------
+    # PLAN
+    # -------------------------
+
     if (
         data.startswith("sub:")
         and data.count(":") == 1
     ):
+
         plan = data.split(":")[1]
 
         if plan not in PLANS:
@@ -2570,8 +2454,8 @@ async def subscription_callback(
             f"⏳ Срок — {p['days']} дней\n"
             f"💵 Цена — {p['usd']}$\n"
             f"⭐️ Stars — {p['stars']}\n\n"
-            "После оплаты подписка и доступ "
-            "в канал выдаются автоматически.\n\n"
+            "После оплаты подписка выдаётся "
+            "автоматически.\n\n"
             "Выберите способ оплаты:"
         )
 
@@ -2584,8 +2468,12 @@ async def subscription_callback(
 
         return
 
-    # Назад
+    # -------------------------
+    # BACK
+    # -------------------------
+
     if data == "pay:back":
+
         await show_subscription(
             update,
             context
@@ -2593,19 +2481,22 @@ async def subscription_callback(
 
         return
 
-    # =====================================================
+    # -------------------------
     # CRYPTOBOT
-    # =====================================================
+    # -------------------------
 
     if data.startswith(
         "pay:crypto:"
     ):
+
         plan = data.split(":")[-1]
 
         if plan not in PLANS:
             return
 
+        # Crypto API не настроен
         if not CRYPTO_PAY_API_TOKEN:
+
             fallback = (
                 CRYPTO_FALLBACK_WEEK
                 if plan == "week"
@@ -2613,6 +2504,7 @@ async def subscription_callback(
             )
 
             if fallback:
+
                 markup = InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
@@ -2623,13 +2515,15 @@ async def subscription_callback(
                     [
                         InlineKeyboardButton(
                             "Я оплатил",
-                            callback_data=
-                            f"manual_crypto:{plan}"
+                            callback_data=(
+                                f"manual_crypto:"
+                                f"{plan}"
+                            )
                         )
                     ],
                     [
                         InlineKeyboardButton(
-                            "❌ Отменить оплату",
+                            "❌ Отменить",
                             callback_data="pay:cancel"
                         )
                     ],
@@ -2638,12 +2532,14 @@ async def subscription_callback(
                 await send_ui(
                     update,
                     context,
-                    "💳 Оплата через CryptoBot\n\n"
-                    "После оплаты нажмите "
-                    "«Я оплатил».\n"
-                    "⚠️ Автопроверка включится "
-                    "после настройки "
-                    "CRYPTO_PAY_API_TOKEN.",
+                    (
+                        "💳 Оплата через CryptoBot\n\n"
+                        "После оплаты нажмите "
+                        "«Я оплатил».\n\n"
+                        "⚠️ Автоматическая проверка "
+                        "будет работать после настройки "
+                        "CRYPTO_PAY_API_TOKEN."
+                    ),
                     markup
                 )
 
@@ -2652,15 +2548,20 @@ async def subscription_callback(
             await send_ui(
                 update,
                 context,
-                "❌ CryptoBot пока не настроен. "
-                "Добавьте CRYPTO_PAY_API_TOKEN.",
+                (
+                    "❌ CryptoBot не настроен.\n\n"
+                    "Добавьте "
+                    "CRYPTO_PAY_API_TOKEN "
+                    "в Environment Variables."
+                ),
                 kb_pay_methods(plan)
             )
 
             return
 
         try:
-            invoice, _payload_id = (
+
+            invoice, _payload = (
                 await create_crypto_invoice(
                     user_id,
                     plan
@@ -2671,25 +2572,20 @@ async def subscription_callback(
                 invoice["invoice_id"]
             )
 
-            payment_id = create_payment(
+            payment_db_id = create_payment(
                 user_id,
                 plan,
                 "cryptobot",
                 str(invoice_id)
             )
 
-            context.user_data[
-                "pending_crypto"
-            ] = {
-                "plan": plan,
-                "invoice_id": invoice_id,
-                "payment_id": payment_id
-            }
-
             url = (
                 invoice.get("bot_invoice_url")
                 or invoice.get(
                     "mini_app_invoice_url"
+                )
+                or invoice.get(
+                    "web_app_invoice_url"
                 )
             )
 
@@ -2703,16 +2599,17 @@ async def subscription_callback(
                 [
                     InlineKeyboardButton(
                         "✅ Я оплатил",
-                        callback_data=
-                        f"check_crypto:"
-                        f"{invoice_id}:"
-                        f"{plan}:"
-                        f"{payment_id}"
+                        callback_data=(
+                            f"check_crypto:"
+                            f"{invoice_id}:"
+                            f"{plan}:"
+                            f"{payment_db_id}"
+                        )
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "❌ Отменить оплату",
+                        "❌ Отменить",
                         callback_data="pay:cancel"
                     )
                 ],
@@ -2721,12 +2618,14 @@ async def subscription_callback(
             await send_ui(
                 update,
                 context,
-                f"💳 Оплата подписки\n\n"
-                f"{PLANS[plan]['title']} — "
-                f"{PLANS[plan]['usd']}$\n\n"
-                "Нажмите кнопку ниже для оплаты.\n"
-                "После успешной оплаты подписка "
-                "и доступ выдадутся автоматически.",
+                (
+                    "💳 Оплата подписки\n\n"
+                    f"{PLANS[plan]['title']} — "
+                    f"{PLANS[plan]['usd']}$\n\n"
+                    "Нажмите кнопку «Оплатить».\n"
+                    "После оплаты бот автоматически "
+                    "выдаст подписку."
+                ),
                 markup
             )
 
@@ -2735,34 +2634,38 @@ async def subscription_callback(
                     context.application,
                     user_id,
                     plan,
-                    payment_id,
+                    payment_db_id,
                     invoice_id
                 )
             )
 
         except Exception:
+
             logger.exception(
-                "Could not create CryptoBot invoice"
+                "Crypto invoice creation failed"
             )
 
             await send_ui(
                 update,
                 context,
-                "❌ Не удалось создать оплату "
-                "CryptoBot. Попробуйте ещё раз "
-                "или выберите Stars.",
+                (
+                    "❌ Не удалось создать счёт.\n\n"
+                    "Попробуйте ещё раз или "
+                    "выберите Telegram Stars."
+                ),
                 kb_pay_methods(plan)
             )
 
         return
 
-    # =====================================================
+    # -------------------------
     # TELEGRAM STARS
-    # =====================================================
+    # -------------------------
 
     if data.startswith(
         "pay:stars:"
     ):
+
         plan = data.split(":")[-1]
 
         if plan not in PLANS:
@@ -2786,16 +2689,17 @@ async def subscription_callback(
         )
 
         try:
+
             await context.bot.send_invoice(
                 chat_id=user_id,
                 title=p["title"],
                 description=(
-                    f"Доступ к функциям "
-                    f"HugCollect на {p['days']} дней "
-                    "и вход в канал подписки."
+                    f"Доступ к функциям бота "
+                    f"на {p['days']} дней."
                 ),
                 payload=(
-                    f"hug:{user_id}:"
+                    f"hug:"
+                    f"{user_id}:"
                     f"{plan}:"
                     f"{payment_db_id}"
                 ),
@@ -2811,28 +2715,25 @@ async def subscription_callback(
 
             await context.bot.send_message(
                 user_id,
-                "⭐️ Оплатите счёт выше.\n"
-                "После успешной оплаты подписка "
-                "и доступ в канал выдадутся автоматически.",
+                (
+                    "⭐️ Оплатите счёт выше.\n\n"
+                    "После успешной оплаты "
+                    "подписка активируется автоматически."
+                ),
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
                             "❌ Отменить",
                             callback_data="pay:cancel"
                         )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "🏠 Главное меню",
-                            callback_data="nav:home"
-                        )
-                    ],
+                    ]
                 ])
             )
 
         except TelegramError:
+
             logger.exception(
-                "Could not send Stars invoice"
+                "Stars invoice failed"
             )
 
             update_payment(
@@ -2842,18 +2743,21 @@ async def subscription_callback(
 
             await context.bot.send_message(
                 user_id,
-                "❌ Не удалось создать счёт Stars. "
-                "Попробуйте CryptoBot.",
+                (
+                    "❌ Не удалось создать счёт Stars.\n\n"
+                    "Попробуйте CryptoBot."
+                ),
                 reply_markup=kb_pay_methods(plan)
             )
 
         return
 
-    # =====================================================
-    # CANCEL PAYMENT
-    # =====================================================
+    # -------------------------
+    # CANCEL
+    # -------------------------
 
     if data == "pay:cancel":
+
         await send_ui(
             update,
             context,
@@ -2863,13 +2767,14 @@ async def subscription_callback(
 
         return
 
-    # =====================================================
-    # CHECK CRYPTO PAYMENT
-    # =====================================================
+    # -------------------------
+    # CRYPTO CHECK
+    # -------------------------
 
     if data.startswith(
         "check_crypto:"
     ):
+
         parts = data.split(":")
 
         if len(parts) < 4:
@@ -2882,31 +2787,177 @@ async def subscription_callback(
         if plan not in PLANS:
             return
 
-        if find_subscription_by_payment(
+        existing = find_subscription_by_payment(
             str(invoice_id)
-        ):
+        )
+
+        if existing:
+
             await send_ui(
                 update,
                 context,
-                "✅ Эта оплата уже зачислена. "
-                "Подписка активна.",
+                "✅ Оплата уже зачислена.",
                 kb_after_pay(None)
             )
 
             return
 
         if not CRYPTO_PAY_API_TOKEN:
-            await send_ui(
-                update,
-                context,
-                "⏳ Автопроверка недоступна "
-                "без CRYPTO_PAY_API_TOKEN.",
-                kb_back_home()
+
+            await q.answer(
+                "Автопроверка не настроена.",
+                show_alert=True
             )
 
             return
 
         try:
+
+            result = await crypto_api(
+                "getInvoices",
+                {
+                    "invoice_ids": str(invoice_id)
+                }
+            )
+
+            items = result.get(
+                "items",
+                []
+            )
+
+            if (
+                items
+                and items[0].get("status")
+                == "paid"
+            ):
+
+                await grant_paid_access(
+                    context.bot,
+                    user_id,
+                    plan,
+                    "cryptobot",
+                    str(invoice_id),
+                    int(payment_db_id)
+                )
+
+                await safe_delete(
+                    q.message
+                )
+
+                return
+
+            await q.answer(
+                (
+                    "Оплата ещё не найдена.\n"
+                    "Подождите немного и попробуйте снова."
+                ),
+                show_alert=True
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Crypto manual check failed"
+            )
+
+            await q.answer(
+                "Не удалось проверить оплату.",
+                show_alert=True
+            )
+
+        return
+
+
+# =========================================================
+# CRYPTO API
+# =========================================================
+
+async def crypto_api(
+    method: str,
+    payload: dict
+):
+    if not CRYPTO_PAY_API_TOKEN:
+        raise RuntimeError(
+            "CRYPTO_PAY_API_TOKEN is not configured"
+        )
+
+    headers = {
+        "Crypto-Pay-API-Token":
+            CRYPTO_PAY_API_TOKEN
+    }
+
+    async with httpx.AsyncClient(
+        timeout=20
+    ) as client:
+
+        response = await client.post(
+            f"https://pay.crypt.bot/api/{method}",
+            json=payload,
+            headers=headers
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+    if not data.get("ok"):
+
+        raise RuntimeError(
+            data.get(
+                "error",
+                {}
+            ).get(
+                "name",
+                "Crypto Pay API error"
+            )
+        )
+
+    return data["result"]
+
+
+async def create_crypto_invoice(
+    user_id: int,
+    plan: str
+):
+    payload_id = (
+        f"hug:"
+        f"{user_id}:"
+        f"{plan}:"
+        f"{int(datetime.now(timezone.utc).timestamp())}"
+    )
+
+    result = await crypto_api(
+        "createInvoice",
+        {
+            "asset": CRYPTO_ASSET,
+            "amount": PLANS[plan]["usd"],
+            "description": PLANS[plan]["title"],
+            "payload": payload_id,
+            "allow_comments": False,
+            "allow_anonymous": False,
+            "expires_in": 1800,
+        }
+    )
+
+    return result, payload_id
+
+
+async def crypto_watch(
+    application: Application,
+    user_id: int,
+    plan: str,
+    payment_db_id: int,
+    invoice_id: int
+):
+    for _ in range(180):
+
+        try:
+
+            if find_subscription_by_payment(
+                str(invoice_id)
+            ):
+                return
+
             result = await crypto_api(
                 "getInvoices",
                 {
@@ -2925,64 +2976,371 @@ async def subscription_callback(
                 and items[0].get("status")
                 == "paid"
             ):
+
                 await grant_paid_access(
-                    context.bot,
+                    application.bot,
                     user_id,
                     plan,
                     "cryptobot",
                     str(invoice_id),
-                    int(payment_db_id)
-                )
-
-                await safe_delete(
-                    q.message
+                    payment_db_id
                 )
 
                 return
 
-            await q.answer(
-                "Оплата ещё не найдена. "
-                "Подождите пару секунд и "
-                "нажмите снова.",
-                show_alert=True
-            )
+            if (
+                items
+                and items[0].get("status")
+                in {
+                    "expired",
+                    "invalid"
+                }
+            ):
+
+                update_payment(
+                    payment_db_id,
+                    items[0].get("status")
+                )
+
+                return
 
         except Exception:
+
             logger.exception(
-                "Manual crypto check failed"
+                "Crypto watcher error"
             )
 
-            await send_ui(
-                update,
-                context,
-                "❌ Не удалось проверить оплату. "
-                "Попробуйте ещё раз.",
-                kb_back_home()
-            )
+        await asyncio.sleep(10)
 
-        return
-
-    # =====================================================
-    # MANUAL CRYPTO
-    # =====================================================
-
-    if data.startswith(
-        "manual_crypto:"
-    ):
-        await send_ui(
-            update,
-            context,
-            "⏳ Без CRYPTO_PAY_API_TOKEN "
-            "бот не может сам подтвердить "
-            "оплату по общей ссылке.\n"
-            "Добавьте токен в Render — тогда "
-            "доступ будет выдаваться автоматически.",
-            kb_back_home()
-        )
+    update_payment(
+        payment_db_id,
+        "timeout"
+    )
 
 
 # =========================================================
-# STARS PAYMENT
+# ACCESS / INVITE
+# =========================================================
+
+async def issue_channel_invite(
+    bot,
+    user_id: int,
+    plan: str
+):
+    channel = PLANS[plan]["channel"]
+
+    if not channel:
+        return None, "no_channel"
+
+    try:
+
+        member = await bot.get_chat_member(
+            channel,
+            user_id
+        )
+
+        if member.status in {
+            "member",
+            "administrator",
+            "creator"
+        }:
+            return None, "already_member"
+
+    except TelegramError:
+        pass
+
+    subscription = get_active_subscription(
+        user_id
+    )
+
+    expire_ts = None
+
+    if subscription:
+
+        try:
+
+            expires_at = datetime.fromisoformat(
+                subscription["expires_at"]
+            )
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            expire_ts = int(
+                expires_at.timestamp()
+            )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    try:
+
+        invite = await bot.create_chat_invite_link(
+            chat_id=channel,
+            name=(
+                f"user {user_id} {plan}"
+            ),
+            member_limit=1,
+            expire_date=expire_ts
+        )
+
+        return (
+            invite.invite_link,
+            "ok"
+        )
+
+    except TelegramError:
+
+        logger.exception(
+            "Could not create invite link"
+        )
+
+        return None, "error"
+
+
+def access_granted_text(
+    plan: str,
+    expires: datetime,
+    invite_status: str
+):
+    text = (
+        "✅ Оплата получена!\n\n"
+        f"💎 Подписка — "
+        f"{PLANS[plan]['title']}\n"
+        f"⏳ Действует до — "
+        f"{expires.strftime('%d.%m.%Y %H:%M')}\n\n"
+        "✔️ Функции бота открыты."
+    )
+
+    if invite_status == "already_member":
+
+        text += (
+            "\n\n🔐 Вы уже состоите "
+            "в канале подписки."
+        )
+
+    elif invite_status == "no_channel":
+
+        text += (
+            "\n\nℹ️ Канал подписки "
+            "не настроен."
+        )
+
+    elif invite_status == "error":
+
+        text += (
+            f"\n\n⚠️ Не удалось выдать "
+            f"ссылку в канал.\n"
+            f"Напишите {SUPPORT_USERNAME}."
+        )
+
+    return text
+
+
+_notified_payments: set[str] = set()
+
+
+async def grant_paid_access(
+    bot,
+    user_id: int,
+    plan: str,
+    method: str,
+    payment_key: str,
+    payment_db_id: int | None = None
+):
+    # Не выдаём одну оплату второй раз
+    if payment_key in _notified_payments:
+
+        return activate_subscription(
+            user_id,
+            plan,
+            method,
+            payment_key
+        )
+
+    existing = find_subscription_by_payment(
+        payment_key
+    )
+
+    if existing:
+
+        _notified_payments.add(
+            payment_key
+        )
+
+        return datetime.fromisoformat(
+            existing["expires_at"]
+        )
+
+    _notified_payments.add(
+        payment_key
+    )
+
+    if payment_db_id:
+
+        update_payment(
+            payment_db_id,
+            "paid",
+            payment_key
+        )
+
+    expires = activate_subscription(
+        user_id,
+        plan,
+        method,
+        payment_key
+    )
+
+    link, invite_status = await issue_channel_invite(
+        bot,
+        user_id,
+        plan
+    )
+
+    text = access_granted_text(
+        plan,
+        expires,
+        invite_status
+    )
+
+    if link:
+
+        text += (
+            "\n\n👇 Ваша ссылка в канал:"
+        )
+
+    await bot.send_message(
+        user_id,
+        text,
+        reply_markup=kb_after_pay(link)
+    )
+
+    return expires
+
+
+async def grant_promo_access(
+    bot,
+    user_id: int,
+    plan: str,
+    code: str
+):
+    payment_key = (
+        f"promo:"
+        f"{code}:"
+        f"{user_id}"
+    )
+
+    # Промокод тоже не выдаём дважды
+    existing = find_subscription_by_payment(
+        payment_key
+    )
+
+    if existing:
+
+        expires = datetime.fromisoformat(
+            existing["expires_at"]
+        )
+
+    else:
+
+        expires = activate_subscription(
+            user_id,
+            plan,
+            "promo",
+            payment_key
+        )
+
+    link, invite_status = await issue_channel_invite(
+        bot,
+        user_id,
+        plan
+    )
+
+    text = (
+        f"✅ Промокод {code} активирован!\n\n"
+        f"💎 Подписка — "
+        f"{PLANS[plan]['title']}\n"
+        f"⏳ Действует до — "
+        f"{expires.strftime('%d.%m.%Y %H:%M')}"
+    )
+
+    if link:
+        text += (
+            "\n\n👇 Ссылка в канал:"
+        )
+
+    await bot.send_message(
+        user_id,
+        text,
+        reply_markup=kb_after_pay(link)
+    )
+
+    return expires
+
+
+# =========================================================
+# PROMO TEXT
+# =========================================================
+
+async def apply_promo_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    raw_code: str
+) -> bool:
+
+    status, plan = redeem_promo(
+        user_id,
+        raw_code
+    )
+
+    if status == "empty":
+
+        await update.message.reply_text(
+            "Введите промокод.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    if status == "invalid":
+        return False
+
+    if status == "already":
+
+        await update.message.reply_text(
+            "❌ Вы уже использовали этот промокод.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    if status == "exhausted":
+
+        await update.message.reply_text(
+            "❌ Этот промокод больше недоступен.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    await grant_promo_access(
+        context.bot,
+        user_id,
+        plan,
+        raw_code.strip().upper()
+    )
+
+    return True
+
+
+# =========================================================
+# STARS
 # =========================================================
 
 async def pre_checkout(
@@ -2998,19 +3356,22 @@ async def pre_checkout(
 
     parts = payload.split(":")
 
-    ok = (
+    valid = (
         len(parts) >= 4
         and parts[0] == "hug"
         and parts[2] in PLANS
     )
 
     try:
-        if ok:
+
+        if valid:
+
             await query.answer(
                 ok=True
             )
 
         else:
+
             await query.answer(
                 ok=False,
                 error_message=(
@@ -3020,8 +3381,9 @@ async def pre_checkout(
             )
 
     except TelegramError:
+
         logger.exception(
-            "pre_checkout failed"
+            "Pre checkout error"
         )
 
 
@@ -3029,7 +3391,10 @@ async def successful_payment(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    payment = update.message.successful_payment
+    payment = (
+        update.message
+        .successful_payment
+    )
 
     payload = payment.invoice_payload
 
@@ -3039,9 +3404,12 @@ async def successful_payment(
         len(parts) < 4
         or parts[0] != "hug"
     ):
+
         await update.message.reply_text(
-            "❌ Не удалось распознать оплату. "
-            "Напишите в поддержку.",
+            (
+                "❌ Не удалось распознать оплату.\n"
+                f"Напишите {SUPPORT_USERNAME}."
+            ),
             reply_markup=kb_back_home()
         )
 
@@ -3051,16 +3419,20 @@ async def successful_payment(
         parts[:4]
     )
 
-    user_id = update.effective_user.id
+    user_id = (
+        update.effective_user.id
+    )
 
     if (
         str(user_id) != payload_user
         or plan not in PLANS
     ):
+
         await update.message.reply_text(
-            "❌ Оплата не совпала "
-            "с вашим аккаунтом. "
-            "Напишите в поддержку.",
+            (
+                "❌ Оплата не совпала "
+                "с аккаунтом."
+            ),
             reply_markup=kb_back_home()
         )
 
@@ -3071,13 +3443,17 @@ async def successful_payment(
     )
 
     try:
+
         db_id = int(
             payment_db_id
         )
 
     except ValueError:
-        db_id = context.user_data.get(
-            "pending_star_payment"
+
+        db_id = (
+            context.user_data.get(
+                "pending_star_payment"
+            )
         )
 
     await grant_paid_access(
@@ -3091,18 +3467,53 @@ async def successful_payment(
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
 async def cmd_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    user_id = update.effective_user.id
+
+    # Только создаём профиль, если его нет.
+    # НИЧЕГО НЕ СБРАСЫВАЕМ.
     ensure_profile(
-        update.effective_user.id
+        user_id
     )
 
-    context.user_data["state"] = None
+    # Просто читаем текущую подписку.
+    # Она не изменяется.
+    subscription = get_active_subscription(
+        user_id
+    )
+
+    if subscription:
+
+        logger.info(
+            "START: active subscription "
+            "user=%s plan=%s expires=%s",
+            user_id,
+            subscription["plan"],
+            subscription["expires_at"]
+        )
+
+    else:
+
+        logger.info(
+            "START: no active subscription "
+            "user=%s",
+            user_id
+        )
+
+    context.user_data[
+        "state"
+    ] = None
+
+    context.user_data.pop(
+        "hug_target",
+        None
+    )
 
     await update.message.reply_text(
         "Меню перенесено в сообщение 👇",
@@ -3127,7 +3538,12 @@ async def handle_text(
         update.message.text or ""
     ).strip()
 
-    user_id = update.effective_user.id
+    if not text:
+        return
+
+    user_id = (
+        update.effective_user.id
+    )
 
     ensure_profile(
         user_id
@@ -3137,8 +3553,12 @@ async def handle_text(
         "state"
     )
 
-    # Получение аккаунта
+    # -------------------------
+    # HUG TARGET
+    # -------------------------
+
     if state == "awaiting_hug_target":
+
         context.user_data[
             "hug_target"
         ] = text
@@ -3148,24 +3568,34 @@ async def handle_text(
         ] = "awaiting_confirm"
 
         await update.message.reply_text(
-            f"Вы уверены, что хотите "
-            f"отправить жалобы {text}?",
+            (
+                f"Вы уверены, что хотите "
+                f"отправить жалобы {text}?"
+            ),
             reply_markup=kb_confirm_hug()
         )
 
         return
 
-    # Ожидание подтверждения
+    # -------------------------
+    # CONFIRM
+    # -------------------------
+
     if state == "awaiting_confirm":
+
         await update.message.reply_text(
-            "Нажмите кнопку в сообщении выше 👆",
+            "Нажмите кнопку выше 👆",
             reply_markup=kb_confirm_hug()
         )
 
         return
 
-    # Промокод
+    # -------------------------
+    # PROMO
+    # -------------------------
+
     if state == "awaiting_promo":
+
         context.user_data[
             "state"
         ] = None
@@ -3178,6 +3608,7 @@ async def handle_text(
         )
 
         if not applied:
+
             await update.message.reply_text(
                 "❌ Промокод не найден.",
                 reply_markup=kb_profile()
@@ -3185,18 +3616,40 @@ async def handle_text(
 
         return
 
-    # Проверка аккаунта
+    # -------------------------
+    # CHECK
+    # -------------------------
+
     if state == "awaiting_check_target":
+
+        context.user_data[
+            "state"
+        ] = None
+
+        await do_check(
+            update,
+            context,
+            user_id,
+            text
+        )
+
+        return
+
+    # -------------------------
+    # SEARCH
+    # -------------------------
+
+    if state == "awaiting_search":
+
+        context.user_data[
+            "state"
+        ] = None
 
         if not await require_subscription(
             update,
             context,
             user_id
         ):
-            context.user_data[
-                "state"
-            ] = None
-
             return
 
         ok, _used = request_usage(
@@ -3204,35 +3657,35 @@ async def handle_text(
         )
 
         if not ok:
-            context.user_data[
-                "state"
-            ] = None
 
             await update.message.reply_text(
-                "⛔️ Лимит на сегодня исчерпан.\n\n"
-                "Доступно 50 запросов в день.",
+                (
+                    "⛔️ Лимит на сегодня исчерпан.\n\n"
+                    "Доступно 50 запросов в день."
+                ),
                 reply_markup=kb_menu()
             )
 
             return
-
-        context.user_data[
-            "state"
-        ] = None
 
         add_check(
             user_id
         )
 
         await update.message.reply_text(
-            f"🤗 Обнимашковость {text}: "
-            f"{random.randint(60, 100)}%",
+            (
+                f"🔎 Результат поиска: {text}\n\n"
+                "✅ Поиск завершён."
+            ),
             reply_markup=kb_menu()
         )
 
         return
 
-    # Проверяем промокод даже без состояния
+    # -------------------------
+    # ПРОМОКОД БЕЗ STATE
+    # -------------------------
+
     applied = await apply_promo_text(
         update,
         context,
@@ -3244,10 +3697,96 @@ async def handle_text(
         return
 
     await update.message.reply_text(
-        "Не понимаю 🙈 "
-        "Воспользуйтесь кнопками в меню.",
+        "Не понимаю 🙈 Воспользуйтесь меню.",
         reply_markup=kb_home()
     )
+
+
+# =========================================================
+# EXPIRATION
+# =========================================================
+
+async def remove_from_channels(
+    bot,
+    user_id: int
+):
+    channels = {
+        p["channel"]
+        for p in PLANS.values()
+        if p["channel"]
+    }
+
+    for channel in channels:
+
+        try:
+
+            await bot.ban_chat_member(
+                channel,
+                user_id
+            )
+
+            await bot.unban_chat_member(
+                channel,
+                user_id,
+                only_if_banned=True
+            )
+
+        except TelegramError as exc:
+
+            logger.warning(
+                "Could not remove expired "
+                "user=%s from channel=%s: %s",
+                user_id,
+                channel,
+                exc
+            )
+
+
+async def expiration_loop(
+    application: Application
+):
+    while True:
+
+        try:
+
+            now = datetime.now(
+                timezone.utc
+            )
+
+            with db() as conn:
+
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM subscriptions
+                    """
+                ).fetchall()
+
+            for row in rows:
+
+                user_id = row["user_id"]
+
+                # Если активной подписки больше нет,
+                # можно убрать пользователя из каналов.
+                if not has_subscription(
+                    user_id
+                ):
+
+                    await remove_from_channels(
+                        application.bot,
+                        user_id
+                    )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "Expiration loop failed"
+            )
+
+        await asyncio.sleep(60)
 
 
 # =========================================================
@@ -3258,7 +3797,9 @@ async def post_init(
     application: Application
 ):
     application.create_task(
-        expiration_loop(application)
+        expiration_loop(
+            application
+        )
     )
 
 
@@ -3267,7 +3808,13 @@ async def post_init(
 # =========================================================
 
 def main():
+
     init_db()
+
+    logger.info(
+        "Database initialized: %s",
+        DB_PATH
+    )
 
     app = (
         Application.builder()
@@ -3276,7 +3823,10 @@ def main():
         .build()
     )
 
-    # Проверка обязательной подписки
+    # -----------------------------------------------------
+    # ОБЯЗАТЕЛЬНАЯ ПОДПИСКА НА КАНАЛ
+    # -----------------------------------------------------
+
     app.add_handler(
         TypeHandler(
             Update,
@@ -3285,7 +3835,10 @@ def main():
         group=-1
     )
 
-    # /start
+    # -----------------------------------------------------
+    # START
+    # -----------------------------------------------------
+
     app.add_handler(
         CommandHandler(
             "start",
@@ -3293,31 +3846,47 @@ def main():
         )
     )
 
-    # Навигация
+    # -----------------------------------------------------
+    # NAVIGATION
+    # -----------------------------------------------------
+
     app.add_handler(
         CallbackQueryHandler(
             nav_callback,
-            pattern=r"^(nav:|menu:|hug:)"
+            pattern=(
+                r"^(nav:|menu:|hug:)"
+            )
         )
     )
 
-    # Подписки и оплаты
+    # -----------------------------------------------------
+    # SUBSCRIPTIONS
+    # -----------------------------------------------------
+
     app.add_handler(
         CallbackQueryHandler(
             subscription_callback,
             pattern=(
-                r"^(sub:|pay:|manual_crypto:|"
+                r"^(sub:|pay:|"
+                r"manual_crypto:|"
                 r"check_crypto:)"
             )
         )
     )
 
-    # Telegram Stars
+    # -----------------------------------------------------
+    # STARS PRECHECKOUT
+    # -----------------------------------------------------
+
     app.add_handler(
         PreCheckoutQueryHandler(
             pre_checkout
         )
     )
+
+    # -----------------------------------------------------
+    # SUCCESSFUL PAYMENT
+    # -----------------------------------------------------
 
     app.add_handler(
         MessageHandler(
@@ -3326,35 +3895,62 @@ def main():
         )
     )
 
-    # Обычный текст
+    # -----------------------------------------------------
+    # TEXT
+    # -----------------------------------------------------
+
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             handle_text
         )
     )
 
-    # Render webhook
+    # -----------------------------------------------------
+    # RENDER WEBHOOK
+    # -----------------------------------------------------
+
     if WEBHOOK_BASE:
+
         webhook_path = BOT_TOKEN
+
+        webhook_url = (
+            f"{WEBHOOK_BASE.rstrip('/')}/"
+            f"{webhook_path}"
+        )
+
+        logger.info(
+            "Starting webhook: %s",
+            webhook_url
+        )
 
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=webhook_path,
-            webhook_url=(
-                f"{WEBHOOK_BASE.rstrip('/')}/"
-                f"{webhook_path}"
-            ),
-            drop_pending_updates=True,
+            webhook_url=webhook_url,
+            drop_pending_updates=True
         )
 
-    # Локальный запуск
+    # -----------------------------------------------------
+    # LOCAL POLLING
+    # -----------------------------------------------------
+
     else:
+
+        logger.info(
+            "Starting polling"
+        )
+
         app.run_polling(
             drop_pending_updates=True
         )
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
