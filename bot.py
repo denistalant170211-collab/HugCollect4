@@ -28,26 +28,43 @@ from telegram.ext import (
     filters,
 )
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("hugbot")
 
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set")
 
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@your_support_username")
-PORT = int(os.environ.get("PORT", "10000"))
+
+SUPPORT_USERNAME = os.environ.get(
+    "SUPPORT_USERNAME",
+    "@your_support_username"
+)
+
+PORT = int(
+    os.environ.get(
+        "PORT",
+        "10000"
+    )
+)
+
 
 WEBHOOK_BASE = (
     os.environ.get("RENDER_EXTERNAL_URL")
     or os.environ.get("PUBLIC_URL")
 )
 
+
 BASE_DIR = Path(__file__).resolve().parent
+
 
 ASSET_CANDIDATES = [
     BASE_DIR / "assets",
@@ -56,27 +73,49 @@ ASSET_CANDIDATES = [
     Path.cwd() / "HugCollectBot" / "assets",
 ]
 
+
 ASSETS_DIR = next(
-    (p for p in ASSET_CANDIDATES if p.is_dir()),
+    (
+        p
+        for p in ASSET_CANDIDATES
+        if p.is_dir()
+    ),
     ASSET_CANDIDATES[0]
 )
+
 
 PROFILE_BANNER = ASSETS_DIR / "profile_banner.png"
 MENU_BANNER = ASSETS_DIR / "menu_banner.png"
 
-logger.info("BASE_DIR=%s", BASE_DIR)
-logger.info("CWD=%s", Path.cwd())
-logger.info("ASSETS_DIR=%s exists=%s", ASSETS_DIR, ASSETS_DIR.is_dir())
+
+logger.info(
+    "BASE_DIR=%s",
+    BASE_DIR
+)
+
+logger.info(
+    "CWD=%s",
+    Path.cwd()
+)
+
+logger.info(
+    "ASSETS_DIR=%s exists=%s",
+    ASSETS_DIR,
+    ASSETS_DIR.is_dir()
+)
+
 logger.info(
     "PROFILE_BANNER=%s exists=%s",
     PROFILE_BANNER,
     PROFILE_BANNER.is_file()
 )
+
 logger.info(
     "MENU_BANNER=%s exists=%s",
     MENU_BANNER,
     MENU_BANNER.is_file()
 )
+
 
 DB_PATH = Path(
     os.environ.get(
@@ -85,30 +124,36 @@ DB_PATH = Path(
     )
 )
 
+
 CRYPTO_PAY_API_TOKEN = os.environ.get(
     "CRYPTO_PAY_API_TOKEN",
     ""
 ).strip()
+
 
 CRYPTO_ASSET = os.environ.get(
     "CRYPTO_ASSET",
     "USDT"
 ).strip().upper()
 
+
 WEEKLY_CHANNEL_ID = os.environ.get(
     "WEEKLY_CHANNEL_ID",
     ""
 ).strip()
+
 
 MONTHLY_CHANNEL_ID = os.environ.get(
     "MONTHLY_CHANNEL_ID",
     ""
 ).strip()
 
+
 SUBSCRIPTION_CHANNEL_ID = os.environ.get(
     "SUBSCRIPTION_CHANNEL_ID",
     ""
 ).strip()
+
 
 REQUIRED_CHANNEL_ID = (
     os.environ.get("REQUIRED_CHANNEL_ID")
@@ -116,15 +161,18 @@ REQUIRED_CHANNEL_ID = (
     or ""
 ).strip()
 
+
 REQUIRED_CHANNEL_URL = os.environ.get(
     "REQUIRED_CHANNEL_URL",
     ""
 ).strip()
 
+
 logger.info(
     "REQUIRED_CHANNEL_ID=%s",
     REQUIRED_CHANNEL_ID or "(not set)"
 )
+
 
 PLANS = {
     "week": {
@@ -143,35 +191,42 @@ PLANS = {
     },
 }
 
+
 CRYPTO_FALLBACK_WEEK = os.environ.get(
     "CRYPTO_FALLBACK_WEEK",
     ""
 ).strip()
+
 
 CRYPTO_FALLBACK_MONTH = os.environ.get(
     "CRYPTO_FALLBACK_MONTH",
     ""
 ).strip()
 
+
 GREETING = (
     "Привет, пользователь!\n"
     "Чем я могу вам помочь?"
 )
 
+
 SUPPORT_TEXT = (
-    f"Если вы столкнулись с проблемой — напишите: "
-    f"{SUPPORT_USERNAME}"
+    f"Если вы столкнулись с проблемой — "
+    f"напишите: {SUPPORT_USERNAME}"
 )
+
 
 PROMO_CODE = os.environ.get(
     "PROMO_CODE",
     "HUGVIP"
 ).strip().upper()
 
+
 PROMO_PLAN = os.environ.get(
     "PROMO_PLAN",
     "month"
 ).strip().lower()
+
 
 PROMO_MAX_USES = os.environ.get(
     "PROMO_MAX_USES",
@@ -179,6 +234,9 @@ PROMO_MAX_USES = os.environ.get(
 ).strip()
 
 
+# =========================================================
+# DATABASE
+# =========================================================
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -280,13 +338,23 @@ def init_db():
         ).fetchone()
 
         if not migrated:
-            conn.execute("UPDATE profiles SET level=0")
             conn.execute(
-                "INSERT INTO meta(key, value) VALUES('level_zero_v1', '1')"
+                "UPDATE profiles SET level=0"
+            )
+
+            conn.execute(
+                """
+                INSERT INTO meta(key, value)
+                VALUES('level_zero_v1', '1')
+                """
             )
 
         if PROMO_CODE:
-            plan = PROMO_PLAN if PROMO_PLAN in PLANS else "month"
+            plan = (
+                PROMO_PLAN
+                if PROMO_PLAN in PLANS
+                else "month"
+            )
 
             max_uses = (
                 int(PROMO_MAX_USES)
@@ -300,11 +368,19 @@ def init_db():
                 (code, plan, max_uses, used, active)
                 VALUES (?, ?, ?, 0, 1)
                 """,
-                (PROMO_CODE, plan, max_uses),
+                (
+                    PROMO_CODE,
+                    plan,
+                    max_uses
+                ),
             )
 
         conn.commit()
 
+
+# =========================================================
+# REQUIRED CHANNEL
+# =========================================================
 
 def required_channel_url() -> str:
     if REQUIRED_CHANNEL_URL:
@@ -475,21 +551,31 @@ async def channel_gate(
     q = update.callback_query
 
     if q and q.data == "gate:check":
-
         subscribed = await is_required_channel_member(
             context.bot,
             user.id
         )
 
         if subscribed:
-            await q.answer("Подписка найдена ✅")
-            await show_home(update, context)
+            await q.answer(
+                "Подписка найдена ✅"
+            )
+
+            await show_home(
+                update,
+                context
+            )
+
         else:
             await q.answer(
                 "Вы ещё не подписаны на канал.",
                 show_alert=True
             )
-            await show_channel_gate(update, context)
+
+            await show_channel_gate(
+                update,
+                context
+            )
 
         raise ApplicationHandlerStop
 
@@ -512,6 +598,10 @@ async def channel_gate(
 
     raise ApplicationHandlerStop
 
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
 def kb_home():
     return InlineKeyboardMarkup([
@@ -705,6 +795,10 @@ def kb_after_pay(link: str | None):
     return InlineKeyboardMarkup(rows)
 
 
+# =========================================================
+# PROFILES
+# =========================================================
+
 def ensure_profile(user_id: int):
     with db() as conn:
         conn.execute(
@@ -748,7 +842,9 @@ def get_profile(user_id: int) -> dict:
         )
 
         if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
+            exp = exp.replace(
+                tzinfo=timezone.utc
+            )
 
         p["sub_days_left"] = max(
             0,
@@ -759,7 +855,9 @@ def get_profile(user_id: int) -> dict:
 
 
 def get_active_subscription(user_id: int):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with db() as conn:
         row = conn.execute(
@@ -771,7 +869,10 @@ def get_active_subscription(user_id: int):
             ORDER BY expires_at DESC
             LIMIT 1
             """,
-            (user_id, now)
+            (
+                user_id,
+                now
+            )
         ).fetchone()
 
     return dict(row) if row else None
@@ -781,6 +882,10 @@ def has_subscription(user_id: int) -> bool:
     return get_active_subscription(user_id) is not None
 
 
+# =========================================================
+# PAYMENTS
+# =========================================================
+
 def create_payment(
     user_id: int,
     plan: str,
@@ -789,7 +894,9 @@ def create_payment(
     status: str = "pending"
 ) -> int:
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with db() as conn:
         cur = conn.execute(
@@ -820,7 +927,9 @@ def update_payment(
     status: str,
     external_id: str | None = None
 ):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with db() as conn:
         if external_id:
@@ -837,6 +946,7 @@ def update_payment(
                     payment_id
                 )
             )
+
         else:
             conn.execute(
                 """
@@ -859,13 +969,18 @@ def claim_payment(
     payment_key: str
 ) -> bool:
 
-    if payment_key and find_subscription_by_payment(payment_key):
+    if (
+        payment_key
+        and find_subscription_by_payment(payment_key)
+    ):
         return False
 
     if payment_id is None:
         return True
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     with db() as conn:
         cur = conn.execute(
@@ -898,7 +1013,9 @@ def get_payment(payment_id: int):
     return dict(row) if row else None
 
 
-def find_subscription_by_payment(payment_id: str):
+def find_subscription_by_payment(
+    payment_id: str
+):
     with db() as conn:
         row = conn.execute(
             """
@@ -928,9 +1045,13 @@ def activate_subscription(
                 existing["expires_at"]
             )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(
+        timezone.utc
+    )
 
-    current = get_active_subscription(user_id)
+    current = get_active_subscription(
+        user_id
+    )
 
     if current:
         current_exp = datetime.fromisoformat(
@@ -942,7 +1063,11 @@ def activate_subscription(
                 tzinfo=timezone.utc
             )
 
-        start = max(now, current_exp)
+        start = max(
+            now,
+            current_exp
+        )
+
     else:
         start = now
 
@@ -974,7 +1099,9 @@ def activate_subscription(
 
         except sqlite3.IntegrityError:
             existing = (
-                find_subscription_by_payment(payment_id)
+                find_subscription_by_payment(
+                    payment_id
+                )
                 if payment_id
                 else None
             )
@@ -988,6 +1115,10 @@ def activate_subscription(
 
     return expires
 
+
+# =========================================================
+# PROMO
+# =========================================================
 
 def redeem_promo(
     user_id: int,
@@ -1005,7 +1136,11 @@ def redeem_promo(
 
     with db() as conn:
         row = conn.execute(
-            "SELECT * FROM promo_codes WHERE code=?",
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code=?
+            """,
             (code,)
         ).fetchone()
 
@@ -1075,7 +1210,14 @@ def redeem_promo(
     return "ok", plan
 
 
-def request_usage(user_id: int) -> tuple[bool, int]:
+# =========================================================
+# DAILY USAGE
+# =========================================================
+
+def request_usage(
+    user_id: int
+) -> tuple[bool, int]:
+
     today = datetime.now(
         timezone.utc
     ).date().isoformat()
@@ -1093,7 +1235,11 @@ def request_usage(user_id: int) -> tuple[bool, int]:
             )
         ).fetchone()
 
-        used = int(row[0]) if row else 0
+        used = (
+            int(row[0])
+            if row
+            else 0
+        )
 
         if used >= 50:
             return False, used
@@ -1110,6 +1256,7 @@ def request_usage(user_id: int) -> tuple[bool, int]:
                     today
                 )
             )
+
         else:
             conn.execute(
                 """
@@ -1128,7 +1275,10 @@ def request_usage(user_id: int) -> tuple[bool, int]:
         return True, used + 1
 
 
-def usage_today(user_id: int) -> int:
+def usage_today(
+    user_id: int
+) -> int:
+
     today = datetime.now(
         timezone.utc
     ).date().isoformat()
@@ -1149,7 +1299,13 @@ def usage_today(user_id: int) -> int:
     return int(row[0]) if row else 0
 
 
-def add_check(user_id: int):
+# =========================================================
+# PROFILE ACTIONS
+# =========================================================
+
+def add_check(
+    user_id: int
+):
     with db() as conn:
         conn.execute(
             """
@@ -1217,6 +1373,10 @@ def get_history(
         ).fetchall()
 
 
+# =========================================================
+# PROGRESS UI
+# =========================================================
+
 def progress_bar(
     percent: int,
     width: int = 10
@@ -1253,6 +1413,10 @@ def hug_progress_text(
         f"{progress_bar(percent)}  {percent}%"
     )
 
+
+# =========================================================
+# PROFILE TEXT
+# =========================================================
 
 def profile_caption(
     profile: dict,
@@ -1310,6 +1474,10 @@ def subscription_required_text():
     )
 
 
+# =========================================================
+# UI
+# =========================================================
+
 async def safe_delete(
     message: Message | None
 ):
@@ -1318,6 +1486,7 @@ async def safe_delete(
 
     try:
         await message.delete()
+
     except TelegramError:
         pass
 
@@ -1333,10 +1502,17 @@ async def send_ui(
     chat_id = update.effective_chat.id
     q = update.callback_query
 
-    if replace and q and q.message:
+    if (
+        replace
+        and q
+        and q.message
+    ):
         await safe_delete(q.message)
 
-    if photo and photo.is_file():
+    if (
+        photo
+        and photo.is_file()
+    ):
         try:
             with photo.open("rb") as fh:
                 await context.bot.send_photo(
@@ -1345,6 +1521,7 @@ async def send_ui(
                     caption=text,
                     reply_markup=markup
                 )
+
                 return
 
         except Exception:
@@ -1379,7 +1556,9 @@ async def show_profile(
 ):
     user_id = update.effective_user.id
 
-    profile = get_profile(user_id)
+    profile = get_profile(
+        user_id
+    )
 
     await send_ui(
         update,
@@ -1449,6 +1628,10 @@ async def require_subscription(
     return False
 
 
+# =========================================================
+# CHANNEL ACCESS
+# =========================================================
+
 async def issue_channel_invite(
     bot,
     user_id: int,
@@ -1461,6 +1644,7 @@ async def issue_channel_invite(
             "No channel configured for plan=%s",
             plan
         )
+
         return None, "no_channel"
 
     try:
@@ -1479,7 +1663,9 @@ async def issue_channel_invite(
     except TelegramError:
         pass
 
-    sub = get_active_subscription(user_id)
+    sub = get_active_subscription(
+        user_id
+    )
 
     expire_ts = None
 
@@ -1575,7 +1761,10 @@ def _access_granted_text(
         "✔️ Функции бота уже открыты"
     )
 
-    if invite_status == "ok" and link:
+    if (
+        invite_status == "ok"
+        and link
+    ):
         text += (
             "\n\n👇 Ваша одноразовая ссылка в канал:"
         )
@@ -1610,7 +1799,6 @@ async def grant_paid_access(
     payment_key: str,
     payment_db_id: int | None = None
 ):
-
     if payment_key in _notified_payments:
         return activate_subscription(
             user_id,
@@ -1619,7 +1807,9 @@ async def grant_paid_access(
             payment_key
         )
 
-    _notified_payments.add(payment_key)
+    _notified_payments.add(
+        payment_key
+    )
 
     claim_payment(
         payment_db_id,
@@ -1709,6 +1899,7 @@ async def apply_promo_text(
             "Введите промокод текстом.",
             reply_markup=kb_profile()
         )
+
         return True
 
     if status == "invalid":
@@ -1719,6 +1910,7 @@ async def apply_promo_text(
             "❌ Вы уже использовали этот промокод.",
             reply_markup=kb_profile()
         )
+
         return True
 
     if status == "exhausted":
@@ -1726,6 +1918,7 @@ async def apply_promo_text(
             "❌ Этот промокод больше недоступен.",
             reply_markup=kb_profile()
         )
+
         return True
 
     await grant_promo_access(
@@ -1737,6 +1930,10 @@ async def apply_promo_text(
 
     return True
 
+
+# =========================================================
+# EXPIRATION
+# =========================================================
 
 async def expiration_loop(
     application: Application
@@ -1776,6 +1973,10 @@ async def expiration_loop(
 
         await asyncio.sleep(60)
 
+
+# =========================================================
+# CRYPTOBOT
+# =========================================================
 
 async def crypto_api(
     method: str,
@@ -1873,8 +2074,7 @@ async def crypto_watch(
 
             if (
                 items
-                and items[0].get("status")
-                == "paid"
+                and items[0].get("status") == "paid"
             ):
                 await grant_paid_access(
                     application.bot,
@@ -1884,6 +2084,7 @@ async def crypto_watch(
                     str(invoice_id),
                     payment_db_id
                 )
+
                 return
 
             if (
@@ -1895,6 +2096,7 @@ async def crypto_watch(
                     payment_db_id,
                     items[0].get("status")
                 )
+
                 return
 
         except Exception:
@@ -1913,7 +2115,7 @@ async def crypto_watch(
 
 
 # =========================================================
-# НОВАЯ АНИМАЦИЯ ОТПРАВКИ ОБНИМАШЕК
+# АНИМАЦИЯ ОТПРАВКИ ЖАЛОБ
 # =========================================================
 
 async def run_hug_animation(
@@ -1923,10 +2125,10 @@ async def run_hug_animation(
     user_id: int,
     target: str
 ):
-    count = random.randint(12, 48)
+    # Количество в финальном результате
+    count = 356
 
-    # Первое сообщение.
-    # Оно заменяет старое сообщение с прогрессом 0%.
+    # Первое сообщение
     start_text = (
         "💤Идет процесс отправления жалоб 💤\n\n"
         "3%\n\n"
@@ -1934,15 +2136,18 @@ async def run_hug_animation(
     )
 
     try:
+        # Пытаемся заменить сообщение
+        # с подтверждением
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=start_text
             )
+
         except BadRequest:
-            # Если старое сообщение нельзя изменить,
-            # отправляем новое.
+            # Если заменить нельзя —
+            # отправляем новое сообщение
             msg = await bot.send_message(
                 chat_id=chat_id,
                 text=start_text
@@ -1950,11 +2155,11 @@ async def run_hug_animation(
 
             message_id = msg.message_id
 
-        # Реальное ожидание.
-        # От 10 до 60 секунд.
+        # Ожидание 1 секунду
         await asyncio.sleep(1)
 
-        # Отдельные сообщения с прогрессом.
+        # Проценты отправляются
+        # отдельными сообщениями
         progress_steps = [
             8,
             20,
@@ -1971,35 +2176,29 @@ async def run_hug_animation(
                 text=f"💤{percent}%💤"
             )
 
-            # Небольшая пауза между сообщениями.
-            await asyncio.sleep(
-                random.uniform(0.8, 1.8)
-            )
+            # Ровно 1 секунда между сообщениями
+            await asyncio.sleep(1)
 
-        # Финальный процент.
+        # 100%
         await bot.send_message(
             chat_id=chat_id,
             text="💤100%💤"
         )
 
+        # Небольшая пауза перед результатом
         await asyncio.sleep(0.5)
 
-        # Записываем обнимашки в БД только после
-        # успешного завершения процесса.
+        # Один раз записываем результат
         add_hug(
             user_id,
             target,
             count
         )
 
-        # Финальное сообщение.
-        done = (
-            f"⭕️Отправлено жалоб — 356⭕️"
-        )
-
+        # Финальный результат
         await bot.send_message(
             chat_id=chat_id,
-            text=done,
+            text=f"⭕️Отправлено жалоб — {count}⭕️",
             reply_markup=kb_hooray()
         )
 
@@ -2008,22 +2207,10 @@ async def run_hug_animation(
             "Hug animation failed"
         )
 
-        try:
-            add_hug(
-                user_id,
-                target,
-                count
-            )
 
-            await bot.send_message(
-                chat_id,
-                f"⭕️Отправлено обнимашек — {count}⭕️",
-                reply_markup=kb_hooray()
-            )
-
-        except TelegramError:
-            pass
-
+# =========================================================
+# HUG
+# =========================================================
 
 async def start_hug(
     update: Update,
@@ -2049,6 +2236,108 @@ async def start_hug(
     )
 
 
+async def confirm_and_send_hug(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int
+):
+    if not await require_subscription(
+        update,
+        context,
+        user_id
+    ):
+        context.user_data["state"] = None
+        return
+
+    ok, _used = request_usage(
+        user_id
+    )
+
+    if not ok:
+        context.user_data["state"] = None
+
+        await send_ui(
+            update,
+            context,
+            "⛔️ Лимит на сегодня исчерпан.\n\n"
+            "Доступно 50 запросов в день.",
+            kb_menu()
+        )
+
+        return
+
+    context.user_data["state"] = None
+
+    target = context.user_data.get(
+        "hug_target",
+        "другу"
+    )
+
+    chat_id = update.effective_chat.id
+    q = update.callback_query
+
+    # Первое сообщение
+    initial_text = (
+        "💤Идет процесс отправления жалоб 💤\n\n"
+        "3%\n\n"
+        "🔰Ожидание до 1 минуты🔰"
+    )
+
+    # Если запуск произошёл через кнопку
+    if q and q.message:
+        try:
+            await q.message.edit_text(
+                initial_text
+            )
+
+            msg_id = q.message.message_id
+
+        except BadRequest:
+            await safe_delete(
+                q.message
+            )
+
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=initial_text
+            )
+
+            msg_id = msg.message_id
+
+    # Если запуск через обычное сообщение
+    elif update.message:
+        msg = await update.message.reply_text(
+            initial_text
+        )
+
+        msg_id = msg.message_id
+
+    # Запасной вариант
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=initial_text
+        )
+
+        msg_id = msg.message_id
+
+    # Запускаем процесс отдельно
+    context.application.create_task(
+        run_hug_animation(
+            context.bot,
+            chat_id,
+            msg_id,
+            user_id,
+            target
+        ),
+        update=update
+    )
+
+
+# =========================================================
+# CHECK
+# =========================================================
+
 async def start_check(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2073,6 +2362,10 @@ async def start_check(
     )
 
 
+# =========================================================
+# SEARCH
+# =========================================================
+
 async def do_search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2085,7 +2378,9 @@ async def do_search(
     ):
         return
 
-    ok, _used = request_usage(user_id)
+    ok, _used = request_usage(
+        user_id
+    )
 
     if not ok:
         await send_ui(
@@ -2095,6 +2390,7 @@ async def do_search(
             "Доступно 50 запросов в день.",
             kb_menu()
         )
+
         return
 
     await send_ui(
@@ -2112,7 +2408,9 @@ async def show_history(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int
 ):
-    history = get_history(user_id)
+    history = get_history(
+        user_id
+    )
 
     if not history:
         await send_ui(
@@ -2122,6 +2420,7 @@ async def show_history(
             "не искали",
             kb_menu()
         )
+
         return
 
     lines = "\n".join(
@@ -2138,103 +2437,9 @@ async def show_history(
     )
 
 
-async def confirm_and_send_hug(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int
-):
-    if not await require_subscription(
-        update,
-        context,
-        user_id
-    ):
-        context.user_data["state"] = None
-        return
-
-    ok, _used = request_usage(user_id)
-
-    if not ok:
-        context.user_data["state"] = None
-
-        await send_ui(
-            update,
-            context,
-            "⛔️ Лимит на сегодня исчерпан.\n\n"
-            "Доступно 50 запросов в день.",
-            kb_menu()
-        )
-        return
-
-    context.user_data["state"] = None
-
-    target = context.user_data.get(
-        "hug_target",
-        "другу"
-    )
-
-    chat_id = update.effective_chat.id
-    q = update.callback_query
-
-    if q and q.message:
-        try:
-            await q.message.edit_text(
-                hug_progress_text(
-                    target,
-                    0,
-                    HUG_STAGES[0][1]
-                )
-            )
-
-            msg_id = q.message.message_id
-
-        except BadRequest:
-            await safe_delete(q.message)
-
-            msg = await context.bot.send_message(
-                chat_id,
-                hug_progress_text(
-                    target,
-                    0,
-                    HUG_STAGES[0][1]
-                )
-            )
-
-            msg_id = msg.message_id
-
-    elif update.message:
-        msg = await update.message.reply_text(
-            hug_progress_text(
-                target,
-                0,
-                HUG_STAGES[0][1]
-            )
-        )
-
-        msg_id = msg.message_id
-
-    else:
-        msg = await context.bot.send_message(
-            chat_id,
-            hug_progress_text(
-                target,
-                0,
-                HUG_STAGES[0][1]
-            )
-        )
-
-        msg_id = msg.message_id
-
-    context.application.create_task(
-        run_hug_animation(
-            context.bot,
-            chat_id,
-            msg_id,
-            user_id,
-            target
-        ),
-        update=update
-    )
-
+# =========================================================
+# NAVIGATION CALLBACKS
+# =========================================================
 
 async def nav_callback(
     update: Update,
@@ -2247,7 +2452,9 @@ async def nav_callback(
     user_id = q.from_user.id
     data = q.data
 
-    ensure_profile(user_id)
+    ensure_profile(
+        user_id
+    )
 
     if data == "nav:home":
         await show_home(
@@ -2331,6 +2538,7 @@ async def nav_callback(
                 "получателя в меню.",
                 kb_menu()
             )
+
             return
 
         await confirm_and_send_hug(
@@ -2350,6 +2558,10 @@ async def nav_callback(
         )
 
 
+# =========================================================
+# SUBSCRIPTIONS CALLBACKS
+# =========================================================
+
 async def subscription_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -2361,8 +2573,11 @@ async def subscription_callback(
     user_id = q.from_user.id
     data = q.data
 
-    ensure_profile(user_id)
+    ensure_profile(
+        user_id
+    )
 
+    # Выбор тарифа
     if (
         data.startswith("sub:")
         and data.count(":") == 1
@@ -2393,14 +2608,22 @@ async def subscription_callback(
 
         return
 
+    # Назад
     if data == "pay:back":
         await show_subscription(
             update,
             context
         )
+
         return
 
-    if data.startswith("pay:crypto:"):
+    # =====================================================
+    # CRYPTOBOT
+    # =====================================================
+
+    if data.startswith(
+        "pay:crypto:"
+    ):
         plan = data.split(":")[-1]
 
         if plan not in PLANS:
@@ -2557,7 +2780,13 @@ async def subscription_callback(
 
         return
 
-    if data.startswith("pay:stars:"):
+    # =====================================================
+    # TELEGRAM STARS
+    # =====================================================
+
+    if data.startswith(
+        "pay:stars:"
+    ):
         plan = data.split(":")[-1]
 
         if plan not in PLANS:
@@ -2576,7 +2805,9 @@ async def subscription_callback(
             "pending_star_payment"
         ] = payment_db_id
 
-        await safe_delete(q.message)
+        await safe_delete(
+            q.message
+        )
 
         try:
             await context.bot.send_invoice(
@@ -2642,6 +2873,10 @@ async def subscription_callback(
 
         return
 
+    # =====================================================
+    # CANCEL PAYMENT
+    # =====================================================
+
     if data == "pay:cancel":
         await send_ui(
             update,
@@ -2649,15 +2884,24 @@ async def subscription_callback(
             "❌ Оплата отменена.",
             kb_home()
         )
+
         return
 
-    if data.startswith("check_crypto:"):
+    # =====================================================
+    # CHECK CRYPTO PAYMENT
+    # =====================================================
+
+    if data.startswith(
+        "check_crypto:"
+    ):
         parts = data.split(":")
 
         if len(parts) < 4:
             return
 
-        _, invoice_id, plan, payment_db_id = parts[:4]
+        _, invoice_id, plan, payment_db_id = (
+            parts[:4]
+        )
 
         if plan not in PLANS:
             return
@@ -2672,6 +2916,7 @@ async def subscription_callback(
                 "Подписка активна.",
                 kb_after_pay(None)
             )
+
             return
 
         if not CRYPTO_PAY_API_TOKEN:
@@ -2682,6 +2927,7 @@ async def subscription_callback(
                 "без CRYPTO_PAY_API_TOKEN.",
                 kb_back_home()
             )
+
             return
 
         try:
@@ -2712,7 +2958,9 @@ async def subscription_callback(
                     int(payment_db_id)
                 )
 
-                await safe_delete(q.message)
+                await safe_delete(
+                    q.message
+                )
 
                 return
 
@@ -2738,7 +2986,13 @@ async def subscription_callback(
 
         return
 
-    if data.startswith("manual_crypto:"):
+    # =====================================================
+    # MANUAL CRYPTO
+    # =====================================================
+
+    if data.startswith(
+        "manual_crypto:"
+    ):
         await send_ui(
             update,
             context,
@@ -2751,13 +3005,20 @@ async def subscription_callback(
         )
 
 
+# =========================================================
+# STARS PAYMENT
+# =========================================================
+
 async def pre_checkout(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.pre_checkout_query
 
-    payload = query.invoice_payload or ""
+    payload = (
+        query.invoice_payload
+        or ""
+    )
 
     parts = payload.split(":")
 
@@ -2772,6 +3033,7 @@ async def pre_checkout(
             await query.answer(
                 ok=True
             )
+
         else:
             await query.answer(
                 ok=False,
@@ -2806,6 +3068,7 @@ async def successful_payment(
             "Напишите в поддержку.",
             reply_markup=kb_back_home()
         )
+
         return
 
     _, payload_user, plan, payment_db_id = (
@@ -2824,6 +3087,7 @@ async def successful_payment(
             "Напишите в поддержку.",
             reply_markup=kb_back_home()
         )
+
         return
 
     charge_id = (
@@ -2831,7 +3095,9 @@ async def successful_payment(
     )
 
     try:
-        db_id = int(payment_db_id)
+        db_id = int(
+            payment_db_id
+        )
 
     except ValueError:
         db_id = context.user_data.get(
@@ -2847,6 +3113,10 @@ async def successful_payment(
         db_id
     )
 
+
+# =========================================================
+# START
+# =========================================================
 
 async def cmd_start(
     update: Update,
@@ -2869,6 +3139,10 @@ async def cmd_start(
     )
 
 
+# =========================================================
+# TEXT HANDLER
+# =========================================================
+
 async def handle_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -2879,12 +3153,15 @@ async def handle_text(
 
     user_id = update.effective_user.id
 
-    ensure_profile(user_id)
+    ensure_profile(
+        user_id
+    )
 
     state = context.user_data.get(
         "state"
     )
 
+    # Получение аккаунта
     if state == "awaiting_hug_target":
         context.user_data[
             "hug_target"
@@ -2902,15 +3179,20 @@ async def handle_text(
 
         return
 
+    # Ожидание подтверждения
     if state == "awaiting_confirm":
         await update.message.reply_text(
             "Нажмите кнопку в сообщении выше 👆",
             reply_markup=kb_confirm_hug()
         )
+
         return
 
+    # Промокод
     if state == "awaiting_promo":
-        context.user_data["state"] = None
+        context.user_data[
+            "state"
+        ] = None
 
         applied = await apply_promo_text(
             update,
@@ -2927,13 +3209,18 @@ async def handle_text(
 
         return
 
+    # Проверка аккаунта
     if state == "awaiting_check_target":
+
         if not await require_subscription(
             update,
             context,
             user_id
         ):
-            context.user_data["state"] = None
+            context.user_data[
+                "state"
+            ] = None
+
             return
 
         ok, _used = request_usage(
@@ -2941,7 +3228,9 @@ async def handle_text(
         )
 
         if not ok:
-            context.user_data["state"] = None
+            context.user_data[
+                "state"
+            ] = None
 
             await update.message.reply_text(
                 "⛔️ Лимит на сегодня исчерпан.\n\n"
@@ -2951,9 +3240,13 @@ async def handle_text(
 
             return
 
-        context.user_data["state"] = None
+        context.user_data[
+            "state"
+        ] = None
 
-        add_check(user_id)
+        add_check(
+            user_id
+        )
 
         await update.message.reply_text(
             f"🤗 Обнимашковость {text}: "
@@ -2963,6 +3256,7 @@ async def handle_text(
 
         return
 
+    # Проверяем промокод даже без состояния
     applied = await apply_promo_text(
         update,
         context,
@@ -2980,6 +3274,10 @@ async def handle_text(
     )
 
 
+# =========================================================
+# POST INIT
+# =========================================================
+
 async def post_init(
     application: Application
 ):
@@ -2987,6 +3285,10 @@ async def post_init(
         expiration_loop(application)
     )
 
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     init_db()
@@ -2998,6 +3300,7 @@ def main():
         .build()
     )
 
+    # Проверка обязательной подписки
     app.add_handler(
         TypeHandler(
             Update,
@@ -3006,6 +3309,7 @@ def main():
         group=-1
     )
 
+    # /start
     app.add_handler(
         CommandHandler(
             "start",
@@ -3013,6 +3317,7 @@ def main():
         )
     )
 
+    # Навигация
     app.add_handler(
         CallbackQueryHandler(
             nav_callback,
@@ -3020,13 +3325,18 @@ def main():
         )
     )
 
+    # Подписки и оплаты
     app.add_handler(
         CallbackQueryHandler(
             subscription_callback,
-            pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"
+            pattern=(
+                r"^(sub:|pay:|manual_crypto:|"
+                r"check_crypto:)"
+            )
         )
     )
 
+    # Telegram Stars
     app.add_handler(
         PreCheckoutQueryHandler(
             pre_checkout
@@ -3040,6 +3350,7 @@ def main():
         )
     )
 
+    # Обычный текст
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -3047,6 +3358,7 @@ def main():
         )
     )
 
+    # Render webhook
     if WEBHOOK_BASE:
         webhook_path = BOT_TOKEN
 
@@ -3061,6 +3373,7 @@ def main():
             drop_pending_updates=True,
         )
 
+    # Локальный запуск
     else:
         app.run_polling(
             drop_pending_updates=True
