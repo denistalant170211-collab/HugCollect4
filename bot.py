@@ -86,7 +86,9 @@ CRYPTO_FALLBACK_MONTH = os.environ.get("CRYPTO_FALLBACK_MONTH", "").strip()
 
 GREETING = "Привет, обнимашка! 🤗\nЧем я могу вам помочь?"
 SUPPORT_TEXT = f"Если вы столкнулись с проблемой — напишите: {SUPPORT_USERNAME}"
-PROMO_CODES = {}
+PROMO_CODE = os.environ.get("PROMO_CODE", "HUGVIP").strip().upper()
+PROMO_PLAN = os.environ.get("PROMO_PLAN", "month").strip().lower()
+PROMO_MAX_USES = os.environ.get("PROMO_MAX_USES", "").strip()
 
 HUG_STAGES = [
     (0, "🌙 Собираем лунное тепло"),
@@ -163,11 +165,35 @@ def init_db():
                 value TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                plan TEXT NOT NULL,
+                max_uses INTEGER,
+                used INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                code TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                redeemed_at TEXT NOT NULL,
+                PRIMARY KEY (code, user_id)
+            )
+        """)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_payment ON subscriptions(payment_id) WHERE payment_id IS NOT NULL")
         migrated = conn.execute("SELECT value FROM meta WHERE key='level_zero_v1'").fetchone()
         if not migrated:
             conn.execute("UPDATE profiles SET level=0")
             conn.execute("INSERT INTO meta(key, value) VALUES('level_zero_v1', '1')")
+        if PROMO_CODE:
+            plan = PROMO_PLAN if PROMO_PLAN in PLANS else "month"
+            max_uses = int(PROMO_MAX_USES) if PROMO_MAX_USES.isdigit() else None
+            conn.execute(
+                "INSERT OR IGNORE INTO promo_codes(code, plan, max_uses, used, active) VALUES(?,?,?,0,1)",
+                (PROMO_CODE, plan, max_uses),
+            )
         conn.commit()
 
 
@@ -362,6 +388,39 @@ def activate_subscription(user_id: int, plan: str, method: str, payment_id: str 
                 return datetime.fromisoformat(existing["expires_at"])
             raise
     return expires
+
+
+def redeem_promo(user_id: int, raw_code: str) -> tuple[str, str | None]:
+    code = (raw_code or "").strip().upper()
+    if not code:
+        return "empty", None
+    with db() as conn:
+        row = conn.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
+        if not row or not int(row["active"]):
+            return "invalid", None
+        plan = row["plan"]
+        if plan not in PLANS:
+            return "invalid", None
+        already = conn.execute(
+            "SELECT 1 FROM promo_redemptions WHERE code=? AND user_id=?",
+            (code, user_id),
+        ).fetchone()
+        if already:
+            return "already", None
+        max_uses = row["max_uses"]
+        if max_uses is not None and int(row["used"]) >= int(max_uses):
+            return "exhausted", None
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            conn.execute(
+                "INSERT INTO promo_redemptions(code, user_id, redeemed_at) VALUES(?,?,?)",
+                (code, user_id, now),
+            )
+            conn.execute("UPDATE promo_codes SET used=used+1 WHERE code=?", (code,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return "already", None
+    return "ok", plan
 
 
 def request_usage(user_id: int) -> tuple[bool, int]:
@@ -570,15 +629,11 @@ async def remove_from_channels(bot, user_id: int):
 _notified_payments: set[str] = set()
 
 
-async def grant_paid_access(bot, user_id: int, plan: str, method: str, payment_key: str, payment_db_id: int | None = None):
-    if payment_key in _notified_payments:
-        return activate_subscription(user_id, plan, method, payment_key)
-    _notified_payments.add(payment_key)
-    claim_payment(payment_db_id, payment_key)
-    expires = activate_subscription(user_id, plan, method, payment_key)
-    link, invite_status = await issue_channel_invite(bot, user_id, plan)
+def _access_granted_text(plan: str, expires: datetime, invite_status: str, header: str, link: str | None = None) -> str:
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
     text = (
-        "✅ Оплата получена!\n\n"
+        f"{header}\n\n"
         f"💎 Подписка: {PLANS[plan]['title']}\n"
         f"⏳ Действует до: {expires.strftime('%d.%m.%Y %H:%M')}\n"
         "✔️ Функции бота уже открыты"
@@ -591,8 +646,51 @@ async def grant_paid_access(bot, user_id: int, plan: str, method: str, payment_k
         text += "\n\nℹ️ Канал ещё настраивается администратором — доступ в боте уже активен."
     else:
         text += f"\n\n⚠️ Ссылку в канал не удалось создать. Напишите {SUPPORT_USERNAME} — подписка в боте уже выдана."
-    await bot.send_message(user_id, text, reply_markup=kb_after_pay(link))
+    return text
+
+
+async def grant_paid_access(bot, user_id: int, plan: str, method: str, payment_key: str, payment_db_id: int | None = None):
+    if payment_key in _notified_payments:
+        return activate_subscription(user_id, plan, method, payment_key)
+    _notified_payments.add(payment_key)
+    claim_payment(payment_db_id, payment_key)
+    expires = activate_subscription(user_id, plan, method, payment_key)
+    link, invite_status = await issue_channel_invite(bot, user_id, plan)
+    await bot.send_message(
+        user_id,
+        _access_granted_text(plan, expires, invite_status, "✅ Оплата получена!", link),
+        reply_markup=kb_after_pay(link),
+    )
     return expires
+
+
+async def grant_promo_access(bot, user_id: int, plan: str, code: str):
+    payment_key = f"promo:{code}:{user_id}"
+    expires = activate_subscription(user_id, plan, "promo", payment_key)
+    link, invite_status = await issue_channel_invite(bot, user_id, plan)
+    await bot.send_message(
+        user_id,
+        _access_granted_text(plan, expires, invite_status, f"✅ Промокод {code} активирован!", link),
+        reply_markup=kb_after_pay(link),
+    )
+    return expires
+
+
+async def apply_promo_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, raw_code: str) -> bool:
+    status, plan = redeem_promo(user_id, raw_code)
+    if status == "empty":
+        await update.effective_message.reply_text("Введите промокод текстом.", reply_markup=kb_profile())
+        return True
+    if status == "invalid":
+        return False
+    if status == "already":
+        await update.effective_message.reply_text("❌ Вы уже использовали этот промокод.", reply_markup=kb_profile())
+        return True
+    if status == "exhausted":
+        await update.effective_message.reply_text("❌ Этот промокод больше недоступен.", reply_markup=kb_profile())
+        return True
+    await grant_promo_access(context.bot, user_id, plan, (raw_code or "").strip().upper())
+    return True
 
 
 async def expiration_loop(application: Application):
@@ -780,8 +878,8 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "nav:support":
         await show_support(update, context)
     elif data == "nav:promo":
-        context.user_data["state"] = None
-        await send_ui(update, context, "Промокоды сейчас отключены.", kb_profile())
+        context.user_data["state"] = "awaiting_promo"
+        await send_ui(update, context, "🎟 Введите промокод следующим сообщением:", kb_profile())
     elif data == "nav:sub":
         await show_subscription(update, context)
     elif data == "menu:hug":
@@ -1010,7 +1108,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "awaiting_promo":
         context.user_data["state"] = None
-        await update.message.reply_text("❌ Промокоды сейчас отключены.", reply_markup=kb_profile())
+        applied = await apply_promo_text(update, context, user_id, text)
+        if not applied:
+            await update.message.reply_text("❌ Промокод не найден.", reply_markup=kb_profile())
         return
 
     if state == "awaiting_check_target":
@@ -1030,6 +1130,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    applied = await apply_promo_text(update, context, user_id, text)
+    if applied:
+        return
     await update.message.reply_text(
         "Не понимаю 🙈 Воспользуйтесь кнопками в меню.",
         reply_markup=kb_home(),
