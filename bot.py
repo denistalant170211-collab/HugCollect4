@@ -2,11 +2,14 @@ import asyncio
 import logging
 import os
 import random
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
 from telegram import (
     Update,
     ReplyKeyboardRemove,
@@ -15,7 +18,12 @@ from telegram import (
     LabeledPrice,
     Message,
 )
-from telegram.error import BadRequest, TelegramError
+
+from telegram.error import (
+    BadRequest,
+    TelegramError,
+)
+
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -35,12 +43,21 @@ from telegram.ext import (
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    format=(
+        "%(asctime)s "
+        "%(levelname)s "
+        "%(name)s "
+        "%(message)s"
+    )
 )
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger(
+    "httpx"
+).setLevel(logging.WARNING)
 
-logger = logging.getLogger("hugbot")
+logger = logging.getLogger(
+    "hugbot"
+)
 
 
 # =========================================================
@@ -53,7 +70,20 @@ BOT_TOKEN = os.environ.get(
 ).strip()
 
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN is not set")
+    raise SystemExit(
+        "BOT_TOKEN is not set"
+    )
+
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    ""
+).strip()
+
+if not DATABASE_URL:
+    raise SystemExit(
+        "DATABASE_URL is not set"
+    )
 
 
 SUPPORT_USERNAME = os.environ.get(
@@ -71,8 +101,12 @@ PORT = int(
 
 
 WEBHOOK_BASE = (
-    os.environ.get("RENDER_EXTERNAL_URL")
-    or os.environ.get("PUBLIC_URL")
+    os.environ.get(
+        "RENDER_EXTERNAL_URL"
+    )
+    or os.environ.get(
+        "PUBLIC_URL"
+    )
     or ""
 ).strip()
 
@@ -109,9 +143,11 @@ def is_admin(
 # PATHS
 # =========================================================
 
-BASE_DIR = Path(
-    __file__
-).resolve().parent
+BASE_DIR = (
+    Path(__file__)
+    .resolve()
+    .parent
+)
 
 
 ASSET_CANDIDATES = [
@@ -133,72 +169,36 @@ ASSETS_DIR = next(
 
 
 PROFILE_BANNER = (
-    ASSETS_DIR / "profile_banner.png"
+    ASSETS_DIR /
+    "profile_banner.png"
 )
+
 
 MENU_BANNER = (
-    ASSETS_DIR / "menu_banner.png"
+    ASSETS_DIR /
+    "menu_banner.png"
 )
 
 
 # =========================================================
-# DATABASE
+# POSTGRESQL POOL
 # =========================================================
 
-# Если на Render будет Persistent Disk:
-#
-# /var/data
-#
-# база автоматически будет:
-#
-# /var/data/hugcollect.db
-#
-# Можно также задать вручную:
-#
-# DB_PATH=/var/data/hugcollect.db
-
-
-RENDER_DATA_DIR = Path(
-    "/var/data"
+DB_POOL = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=5,
+    open=False,
+    kwargs={
+        "row_factory": dict_row
+    },
 )
 
-
-if (
-    RENDER_DATA_DIR.exists()
-    and os.access(
-        RENDER_DATA_DIR,
-        os.W_OK
-    )
-):
-    DEFAULT_DB_PATH = (
-        RENDER_DATA_DIR
-        / "hugcollect.db"
-    )
-else:
-    DEFAULT_DB_PATH = (
-        BASE_DIR
-        / "hugcollect.db"
-    )
+DB_OPENED = False
 
 
-DB_PATH = Path(
-    os.environ.get(
-        "DB_PATH",
-        str(DEFAULT_DB_PATH)
-    )
-)
-
-
-DB_PATH.parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-logger.info(
-    "DB_PATH=%s",
-    DB_PATH
-)
+def db():
+    return DB_POOL.connection()
 
 
 # =========================================================
@@ -295,7 +295,7 @@ PLANS = {
         "title": "Недельная подписка",
         "days": 7,
 
-        # CryptoBot
+        # CryptoBot USD/USDT
         "usd": "5",
 
         # Telegram Stars
@@ -311,7 +311,7 @@ PLANS = {
         "title": "Месячная подписка",
         "days": 30,
 
-        # CryptoBot
+        # CryptoBot USD/USDT
         "usd": "9",
 
         # Telegram Stars
@@ -327,8 +327,8 @@ PLANS = {
         "title": "Годовая подписка",
         "days": 365,
 
-        # Цена CryptoBot берётся из ENV
-        # YEAR_PRICE_USD.
+        # Для CryptoBot можно задать:
+        # YEAR_PRICE_USD=...
         "usd": YEAR_PRICE_USD,
 
         # Telegram Stars
@@ -366,7 +366,7 @@ PROMO_MAX_USES = os.environ.get(
 
 
 # =========================================================
-# TEXTS
+# TEXT
 # =========================================================
 
 GREETING = (
@@ -393,52 +393,20 @@ CHANNEL_GATE_TEXT = (
 
 
 # =========================================================
-# DATABASE
+# DATABASE INIT
 # =========================================================
-
-def db():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
-
-
-def ensure_column(
-    conn,
-    table_name: str,
-    column_name: str,
-    definition: str
-):
-    columns = {
-        row["name"]
-        for row in conn.execute(
-            f"PRAGMA table_info({table_name})"
-        ).fetchall()
-    }
-
-    if column_name not in columns:
-
-        conn.execute(
-            f"""
-            ALTER TABLE {table_name}
-            ADD COLUMN {column_name} {definition}
-            """
-        )
-
 
 def init_db():
 
-    with db() as conn:
+    global DB_OPENED
 
-        conn.execute(
-            """
-            PRAGMA journal_mode=WAL
-            """
+    if not DB_OPENED:
+        DB_POOL.open(
+            wait=True
         )
+        DB_OPENED = True
+
+    with db() as conn:
 
         # ---------------------------------------------
         # PROFILES
@@ -447,29 +415,15 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS profiles (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 level INTEGER NOT NULL DEFAULT 0,
                 warmth INTEGER NOT NULL DEFAULT 1000,
                 ref_code TEXT NOT NULL DEFAULT 'HUGGER',
                 checks INTEGER NOT NULL DEFAULT 0,
-                first_seen_at TEXT,
+                first_seen_at TIMESTAMPTZ,
                 referral_bonus_days INTEGER NOT NULL DEFAULT 0
             )
             """
-        )
-
-        ensure_column(
-            conn,
-            "profiles",
-            "first_seen_at",
-            "TEXT"
-        )
-
-        ensure_column(
-            conn,
-            "profiles",
-            "referral_bonus_days",
-            "INTEGER NOT NULL DEFAULT 0"
         )
 
         # ---------------------------------------------
@@ -479,11 +433,11 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS hugs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 target TEXT NOT NULL,
                 count INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TIMESTAMPTZ NOT NULL
             )
             """
         )
@@ -495,14 +449,14 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 plan TEXT NOT NULL,
                 method TEXT NOT NULL,
                 payment_id TEXT,
-                starts_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                starts_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
             )
             """
         )
@@ -514,14 +468,16 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 plan TEXT NOT NULL,
                 method TEXT NOT NULL,
                 external_id TEXT,
+                amount NUMERIC(18, 4),
+                currency TEXT,
                 status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
             )
             """
         )
@@ -533,8 +489,8 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_usage (
-                user_id INTEGER NOT NULL,
-                usage_date TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                usage_date DATE NOT NULL,
                 requests INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (
                     user_id,
@@ -568,7 +524,7 @@ def init_db():
                 plan TEXT NOT NULL,
                 max_uses INTEGER,
                 used INTEGER NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1
+                active BOOLEAN NOT NULL DEFAULT TRUE
             )
             """
         )
@@ -581,8 +537,8 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS promo_redemptions (
                 code TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                redeemed_at TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                redeemed_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (
                     code,
                     user_id
@@ -598,13 +554,50 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id INTEGER NOT NULL,
-                referred_id INTEGER NOT NULL UNIQUE,
-                created_at TEXT NOT NULL,
-                rewarded INTEGER NOT NULL DEFAULT 0,
-                rewarded_at TEXT
+                id BIGSERIAL PRIMARY KEY,
+                referrer_id BIGINT NOT NULL,
+                referred_id BIGINT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL,
+                rewarded BOOLEAN NOT NULL DEFAULT FALSE,
+                rewarded_at TIMESTAMPTZ
             )
+            """
+        )
+
+        # ---------------------------------------------
+        # MIGRATION COLUMNS
+        # ---------------------------------------------
+
+        conn.execute(
+            """
+            ALTER TABLE profiles
+            ADD COLUMN IF NOT EXISTS
+            first_seen_at TIMESTAMPTZ
+            """
+        )
+
+        conn.execute(
+            """
+            ALTER TABLE profiles
+            ADD COLUMN IF NOT EXISTS
+            referral_bonus_days INTEGER
+            NOT NULL DEFAULT 0
+            """
+        )
+
+        conn.execute(
+            """
+            ALTER TABLE payments
+            ADD COLUMN IF NOT EXISTS
+            amount NUMERIC(18, 4)
+            """
+        )
+
+        conn.execute(
+            """
+            ALTER TABLE payments
+            ADD COLUMN IF NOT EXISTS
+            currency TEXT
             """
         )
 
@@ -630,54 +623,46 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_subscriptions_user_id
+            ON subscriptions(user_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_hugs_user_id
+            ON hugs(user_id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_referrals_referrer
+            ON referrals(referrer_id)
+            """
+        )
+
         # ---------------------------------------------
-        # MIGRATION
+        # EXISTING PROFILES
         # ---------------------------------------------
 
-        now_iso = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+        now = datetime.now(
+            timezone.utc
         )
 
         conn.execute(
             """
             UPDATE profiles
-            SET first_seen_at=?
+            SET first_seen_at=%s
             WHERE first_seen_at IS NULL
             """,
-            (now_iso,)
+            (now,)
         )
-
-        migrated = conn.execute(
-            """
-            SELECT value
-            FROM meta
-            WHERE key='level_zero_v1'
-            """
-        ).fetchone()
-
-        if not migrated:
-
-            conn.execute(
-                """
-                UPDATE profiles
-                SET level=0
-                """
-            )
-
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO meta(
-                    key,
-                    value
-                )
-                VALUES(
-                    'level_zero_v1',
-                    '1'
-                )
-                """
-            )
 
         # ---------------------------------------------
         # DEFAULT PROMO
@@ -699,7 +684,7 @@ def init_db():
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO promo_codes(
+                INSERT INTO promo_codes(
                     code,
                     plan,
                     max_uses,
@@ -707,12 +692,14 @@ def init_db():
                     active
                 )
                 VALUES(
-                    ?,
-                    ?,
-                    ?,
+                    %s,
+                    %s,
+                    %s,
                     0,
-                    1
+                    TRUE
                 )
+                ON CONFLICT(code)
+                DO NOTHING
                 """,
                 (
                     PROMO_CODE,
@@ -723,6 +710,10 @@ def init_db():
 
         conn.commit()
 
+    logger.info(
+        "PostgreSQL database initialized"
+    )
+
 
 # =========================================================
 # PROFILE
@@ -731,17 +722,15 @@ def init_db():
 def ensure_profile(
     user_id: int
 ):
-    now_iso = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
+    now = datetime.now(
+        timezone.utc
     )
 
     with db() as conn:
 
         conn.execute(
             """
-            INSERT OR IGNORE INTO profiles(
+            INSERT INTO profiles(
                 user_id,
                 level,
                 warmth,
@@ -751,18 +740,20 @@ def ensure_profile(
                 referral_bonus_days
             )
             VALUES(
-                ?,
+                %s,
                 0,
                 1000,
                 'HUGGER',
                 0,
-                ?,
+                %s,
                 0
             )
+            ON CONFLICT(user_id)
+            DO NOTHING
             """,
             (
                 user_id,
-                now_iso
+                now
             )
         )
 
@@ -776,59 +767,21 @@ def ensure_profile(
 def get_active_subscription(
     user_id: int
 ):
-    """
-    Все подписки пользователя достаются из SQLite,
-    после чего expires_at сравнивается Python.
-
-    Это позволяет избежать проблем с timezone
-    и SQLite string comparison.
-    """
-
-    now = datetime.now(
-        timezone.utc
-    )
-
     with db() as conn:
 
-        rows = conn.execute(
+        row = conn.execute(
             """
             SELECT *
             FROM subscriptions
-            WHERE user_id=?
+            WHERE user_id=%s
+              AND expires_at > NOW()
             ORDER BY expires_at DESC
+            LIMIT 1
             """,
             (user_id,)
-        ).fetchall()
+        ).fetchone()
 
-    for row in rows:
-
-        try:
-
-            expires_at = datetime.fromisoformat(
-                row["expires_at"]
-            )
-
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            if expires_at > now:
-                return dict(row)
-
-        except (
-            ValueError,
-            TypeError
-        ):
-
-            logger.warning(
-                "Invalid subscription date: "
-                "user=%s value=%s",
-                user_id,
-                row["expires_at"]
-            )
-
-    return None
+    return row
 
 
 def has_subscription(
@@ -860,7 +813,7 @@ def get_profile(
             """
             SELECT *
             FROM profiles
-            WHERE user_id=?
+            WHERE user_id=%s
             """,
             (user_id,)
         ).fetchone()
@@ -870,21 +823,23 @@ def get_profile(
             SELECT COALESCE(
                 SUM(count),
                 0
-            )
+            ) AS total
             FROM hugs
-            WHERE user_id=?
+            WHERE user_id=%s
             """,
             (user_id,)
-        ).fetchone()[0]
+        ).fetchone()
 
     profile = dict(row)
 
     profile["sent"] = int(
-        sent or 0
+        sent["total"] or 0
     )
 
-    subscription = get_active_subscription(
-        user_id
+    subscription = (
+        get_active_subscription(
+            user_id
+        )
     )
 
     profile["sub"] = subscription
@@ -897,34 +852,28 @@ def get_profile(
 
     if subscription:
 
-        try:
+        expires_at = (
+            subscription["expires_at"]
+        )
 
-            expires_at = datetime.fromisoformat(
-                subscription["expires_at"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(
+                tzinfo=timezone.utc
             )
 
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            seconds_left = (
-                expires_at
-                - datetime.now(timezone.utc)
-            ).total_seconds()
-
-            profile["sub_days_left"] = max(
-                0,
-                int(
-                    seconds_left / 86400
-                )
+        seconds_left = (
+            expires_at
+            - datetime.now(
+                timezone.utc
             )
+        ).total_seconds()
 
-        except (
-            ValueError,
-            TypeError
-        ):
-            pass
+        profile["sub_days_left"] = max(
+            0,
+            int(
+                seconds_left / 86400
+            )
+        )
 
     return profile
 
@@ -938,52 +887,61 @@ def create_payment(
     plan: str,
     method: str,
     external_id: str | None,
+    amount: float | int | None,
+    currency: str | None,
     status: str = "pending"
 ) -> int:
 
-    now = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
+    now = datetime.now(
+        timezone.utc
     )
 
     with db() as conn:
 
-        cur = conn.execute(
+        row = conn.execute(
             """
             INSERT INTO payments(
                 user_id,
                 plan,
                 method,
                 external_id,
+                amount,
+                currency,
                 status,
                 created_at,
                 updated_at
             )
             VALUES(
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
             )
+            RETURNING id
             """,
             (
                 user_id,
                 plan,
                 method,
                 external_id,
+                amount,
+                currency,
                 status,
                 now,
                 now
             )
-        )
+        ).fetchone()
 
         conn.commit()
 
-        return cur.lastrowid
+    return int(
+        row["id"]
+    )
 
 
 def update_payment(
@@ -991,10 +949,8 @@ def update_payment(
     status: str,
     external_id: str | None = None
 ):
-    now = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
+    now = datetime.now(
+        timezone.utc
     )
 
     with db() as conn:
@@ -1004,10 +960,10 @@ def update_payment(
             conn.execute(
                 """
                 UPDATE payments
-                SET status=?,
-                    external_id=?,
-                    updated_at=?
-                WHERE id=?
+                SET status=%s,
+                    external_id=%s,
+                    updated_at=%s
+                WHERE id=%s
                 """,
                 (
                     status,
@@ -1022,9 +978,9 @@ def update_payment(
             conn.execute(
                 """
                 UPDATE payments
-                SET status=?,
-                    updated_at=?
-                WHERE id=?
+                SET status=%s,
+                    updated_at=%s
+                WHERE id=%s
                 """,
                 (
                     status,
@@ -1045,16 +1001,12 @@ def get_payment(
             """
             SELECT *
             FROM payments
-            WHERE id=?
+            WHERE id=%s
             """,
             (payment_id,)
         ).fetchone()
 
-    return (
-        dict(row)
-        if row
-        else None
-    )
+    return row
 
 
 def find_subscription_by_payment(
@@ -1066,17 +1018,13 @@ def find_subscription_by_payment(
             """
             SELECT *
             FROM subscriptions
-            WHERE payment_id=?
+            WHERE payment_id=%s
             LIMIT 1
             """,
             (payment_id,)
         ).fetchone()
 
-    return (
-        dict(row)
-        if row
-        else None
-    )
+    return row
 
 
 # =========================================================
@@ -1095,27 +1043,19 @@ def activate_subscription(
         )
 
     # ---------------------------------------------
-    # Защита от повторной оплаты
+    # Дубликат оплаты
     # ---------------------------------------------
 
     if payment_id:
 
-        existing = find_subscription_by_payment(
-            payment_id
+        existing = (
+            find_subscription_by_payment(
+                payment_id
+            )
         )
 
         if existing:
-
-            expires_at = datetime.fromisoformat(
-                existing["expires_at"]
-            )
-
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            return expires_at
+            return existing["expires_at"]
 
     now = datetime.now(
         timezone.utc
@@ -1125,13 +1065,15 @@ def activate_subscription(
     # Текущая подписка
     # ---------------------------------------------
 
-    current = get_active_subscription(
-        user_id
+    current = (
+        get_active_subscription(
+            user_id
+        )
     )
 
     if current:
 
-        current_exp = datetime.fromisoformat(
+        current_exp = (
             current["expires_at"]
         )
 
@@ -1150,23 +1092,25 @@ def activate_subscription(
         starts_at = now
 
     # ---------------------------------------------
-    # Бонусные дни рефералов
+    # Бонусные дни
     # ---------------------------------------------
 
     with db() as conn:
 
-        row = conn.execute(
+        bonus_row = conn.execute(
             """
             SELECT referral_bonus_days
             FROM profiles
-            WHERE user_id=?
+            WHERE user_id=%s
             """,
             (user_id,)
         ).fetchone()
 
     referral_bonus_days = (
-        int(row["referral_bonus_days"])
-        if row
+        int(
+            bonus_row["referral_bonus_days"]
+        )
+        if bonus_row
         else 0
     )
 
@@ -1187,8 +1131,6 @@ def activate_subscription(
             days=referral_bonus_days
         )
 
-    now_iso = now.isoformat()
-
     # ---------------------------------------------
     # INSERT
     # ---------------------------------------------
@@ -1201,24 +1143,14 @@ def activate_subscription(
                 """
                 SELECT *
                 FROM subscriptions
-                WHERE payment_id=?
+                WHERE payment_id=%s
                 LIMIT 1
                 """,
                 (payment_id,)
             ).fetchone()
 
             if already:
-
-                result = datetime.fromisoformat(
-                    already["expires_at"]
-                )
-
-                if result.tzinfo is None:
-                    result = result.replace(
-                        tzinfo=timezone.utc
-                    )
-
-                return result
+                return already["expires_at"]
 
         conn.execute(
             """
@@ -1232,13 +1164,13 @@ def activate_subscription(
                 created_at
             )
             VALUES(
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
             )
             """,
             (
@@ -1246,20 +1178,19 @@ def activate_subscription(
                 plan,
                 method,
                 payment_id,
-                starts_at.isoformat(),
-                expires_at.isoformat(),
-                now_iso
+                starts_at,
+                expires_at,
+                now
             )
         )
 
-        # Бонусные дни использованы
         if referral_bonus_days > 0:
 
             conn.execute(
                 """
                 UPDATE profiles
                 SET referral_bonus_days=0
-                WHERE user_id=?
+                WHERE user_id=%s
                 """,
                 (user_id,)
             )
@@ -1267,8 +1198,11 @@ def activate_subscription(
         conn.commit()
 
     logger.info(
-        "SUBSCRIPTION ACTIVATED: "
-        "user=%s plan=%s method=%s expires=%s",
+        (
+            "SUBSCRIPTION ACTIVATED: "
+            "user=%s plan=%s method=%s "
+            "expires=%s"
+        ),
         user_id,
         plan,
         method,
@@ -1276,6 +1210,208 @@ def activate_subscription(
     )
 
     return expires_at
+
+
+# =========================================================
+# DAILY USAGE
+# =========================================================
+
+def request_usage(
+    user_id: int
+) -> tuple[bool, int]:
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT requests
+            FROM daily_usage
+            WHERE user_id=%s
+              AND usage_date=%s
+            """,
+            (
+                user_id,
+                today
+            )
+        ).fetchone()
+
+        used = (
+            int(row["requests"])
+            if row
+            else 0
+        )
+
+        if used >= 50:
+            return False, used
+
+        if row:
+
+            conn.execute(
+                """
+                UPDATE daily_usage
+                SET requests=requests+1
+                WHERE user_id=%s
+                  AND usage_date=%s
+                """,
+                (
+                    user_id,
+                    today
+                )
+            )
+
+        else:
+
+            conn.execute(
+                """
+                INSERT INTO daily_usage(
+                    user_id,
+                    usage_date,
+                    requests
+                )
+                VALUES(
+                    %s,
+                    %s,
+                    1
+                )
+                """,
+                (
+                    user_id,
+                    today
+                )
+            )
+
+        conn.commit()
+
+    return True, used + 1
+
+
+def usage_today(
+    user_id: int
+) -> int:
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT requests
+            FROM daily_usage
+            WHERE user_id=%s
+              AND usage_date=%s
+            """,
+            (
+                user_id,
+                today
+            )
+        ).fetchone()
+
+    if not row:
+        return 0
+
+    return int(
+        row["requests"]
+    )
+
+
+# =========================================================
+# HUGS
+# =========================================================
+
+def add_hug(
+    user_id: int,
+    target: str,
+    count: int
+):
+    now = datetime.now(
+        timezone.utc
+    )
+
+    with db() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO hugs(
+                user_id,
+                target,
+                count,
+                created_at
+            )
+            VALUES(
+                %s,
+                %s,
+                %s,
+                %s
+            )
+            """,
+            (
+                user_id,
+                target,
+                count,
+                now
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET warmth=LEAST(
+                1000,
+                warmth+10
+            )
+            WHERE user_id=%s
+            """,
+            (user_id,)
+        )
+
+        conn.commit()
+
+
+def add_check(
+    user_id: int
+):
+    with db() as conn:
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET checks=checks+1
+            WHERE user_id=%s
+            """,
+            (user_id,)
+        )
+
+        conn.commit()
+
+
+def get_history(
+    user_id: int,
+    limit: int = 10
+):
+    with db() as conn:
+
+        return conn.execute(
+            """
+            SELECT
+                target,
+                count,
+                created_at
+            FROM hugs
+            WHERE user_id=%s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (
+                user_id,
+                limit
+            )
+        ).fetchall()
 
 
 # =========================================================
@@ -1287,7 +1423,9 @@ def add_referral(
     referred_id: int
 ) -> bool:
 
-    if referrer_id == referred_id:
+    if (
+        referrer_id == referred_id
+    ):
         return False
 
     ensure_profile(
@@ -1298,60 +1436,53 @@ def add_referral(
         referred_id
     )
 
+    now = datetime.now(
+        timezone.utc
+    )
+
     with db() as conn:
 
-        existing = conn.execute(
+        row = conn.execute(
             """
-            SELECT 1
-            FROM referrals
-            WHERE referred_id=?
-            LIMIT 1
+            INSERT INTO referrals(
+                referrer_id,
+                referred_id,
+                created_at,
+                rewarded
+            )
+            VALUES(
+                %s,
+                %s,
+                %s,
+                FALSE
+            )
+            ON CONFLICT(referred_id)
+            DO NOTHING
+            RETURNING id
             """,
-            (referred_id,)
+            (
+                referrer_id,
+                referred_id,
+                now
+            )
         ).fetchone()
 
-        if existing:
-            return False
+        conn.commit()
 
-        try:
+    if row:
 
-            conn.execute(
-                """
-                INSERT INTO referrals(
-                    referrer_id,
-                    referred_id,
-                    created_at,
-                    rewarded
-                )
-                VALUES(
-                    ?,
-                    ?,
-                    ?,
-                    0
-                )
-                """,
-                (
-                    referrer_id,
-                    referred_id,
-                    datetime.now(
-                        timezone.utc
-                    ).isoformat()
-                )
-            )
-
-            conn.commit()
-
-            logger.info(
+        logger.info(
+            (
                 "REFERRAL ADDED: "
-                "referrer=%s referred=%s",
-                referrer_id,
-                referred_id
-            )
+                "referrer=%s referred=%s"
+            ),
+            referrer_id,
+            referred_id
+        )
 
-            return True
+        return True
 
-        except sqlite3.IntegrityError:
-            return False
+    return False
 
 
 def get_referral_count(
@@ -1362,15 +1493,15 @@ def get_referral_count(
 
         row = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM referrals
-            WHERE referrer_id=?
+            WHERE referrer_id=%s
             """,
             (user_id,)
         ).fetchone()
 
     return int(
-        row[0]
+        row["total"]
     )
 
 
@@ -1382,16 +1513,16 @@ def get_referral_rewarded_count(
 
         row = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM referrals
-            WHERE referrer_id=?
-            AND rewarded=1
+            WHERE referrer_id=%s
+              AND rewarded=TRUE
             """,
             (user_id,)
         ).fetchone()
 
     return int(
-        row[0]
+        row["total"]
     )
 
 
@@ -1405,7 +1536,7 @@ def get_referral_bonus_days(
             """
             SELECT referral_bonus_days
             FROM profiles
-            WHERE user_id=?
+            WHERE user_id=%s
             """,
             (user_id,)
         ).fetchone()
@@ -1437,11 +1568,8 @@ async def reward_referrer_for_purchase(
     referred_user_id: int
 ):
     """
-    Реферальный бонус начисляется только
-    после первой реальной оплаты приглашённого.
-
-    За каждую пару referrer -> referred
-    бонус выдаётся только один раз.
+    Бонус выдаётся один раз,
+    после первой успешной оплаты реферала.
     """
 
     with db() as conn:
@@ -1450,8 +1578,8 @@ async def reward_referrer_for_purchase(
             """
             SELECT *
             FROM referrals
-            WHERE referred_id=?
-            AND rewarded=0
+            WHERE referred_id=%s
+              AND rewarded=FALSE
             LIMIT 1
             """,
             (referred_user_id,)
@@ -1464,7 +1592,10 @@ async def reward_referrer_for_purchase(
         referral["referrer_id"]
     )
 
-    if referrer_id == referred_user_id:
+    if (
+        referrer_id
+        == referred_user_id
+    ):
         return False
 
     reward_days = max(
@@ -1472,108 +1603,102 @@ async def reward_referrer_for_purchase(
         REFERRAL_REWARD_DAYS
     )
 
-    subscription = get_active_subscription(
-        referrer_id
+    subscription = (
+        get_active_subscription(
+            referrer_id
+        )
     )
 
     # ---------------------------------------------
-    # У реферера уже есть подписка
+    # У реферера есть подписка
     # ---------------------------------------------
 
     if subscription:
 
-        try:
+        expires_at = (
+            subscription["expires_at"]
+        )
 
-            expires_at = datetime.fromisoformat(
-                subscription["expires_at"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(
+                tzinfo=timezone.utc
             )
 
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
+        new_expires_at = (
+            expires_at
+            + timedelta(
+                days=reward_days
+            )
+        )
 
-            new_expires_at = (
-                expires_at
-                + timedelta(
-                    days=reward_days
+        with db() as conn:
+
+            updated = conn.execute(
+                """
+                UPDATE referrals
+                SET rewarded=TRUE,
+                    rewarded_at=%s
+                WHERE id=%s
+                  AND rewarded=FALSE
+                """,
+                (
+                    datetime.now(
+                        timezone.utc
+                    ),
+                    referral["id"]
                 )
             )
 
-            with db() as conn:
+            if updated.rowcount == 0:
+                return False
 
-                cur = conn.execute(
-                    """
-                    UPDATE referrals
-                    SET rewarded=1,
-                        rewarded_at=?
-                    WHERE id=?
-                    AND rewarded=0
-                    """,
-                    (
-                        datetime.now(
-                            timezone.utc
-                        ).isoformat(),
-                        referral["id"]
-                    )
+            conn.execute(
+                """
+                UPDATE subscriptions
+                SET expires_at=%s
+                WHERE id=%s
+                """,
+                (
+                    new_expires_at,
+                    subscription["id"]
                 )
+            )
 
-                if cur.rowcount == 0:
-                    return False
-
-                conn.execute(
-                    """
-                    UPDATE subscriptions
-                    SET expires_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        new_expires_at.isoformat(),
-                        subscription["id"]
-                    )
-                )
-
-                conn.commit()
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            return False
+            conn.commit()
 
     # ---------------------------------------------
-    # У реферера подписки нет
+    # У реферера нет подписки
     # ---------------------------------------------
 
     else:
 
         with db() as conn:
 
-            cur = conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE referrals
-                SET rewarded=1,
-                    rewarded_at=?
-                WHERE id=?
-                AND rewarded=0
+                SET rewarded=TRUE,
+                    rewarded_at=%s
+                WHERE id=%s
+                  AND rewarded=FALSE
                 """,
                 (
                     datetime.now(
                         timezone.utc
-                    ).isoformat(),
+                    ),
                     referral["id"]
                 )
             )
 
-            if cur.rowcount == 0:
+            if updated.rowcount == 0:
                 return False
 
             conn.execute(
                 """
                 UPDATE profiles
-                SET referral_bonus_days=
-                    referral_bonus_days+?
-                WHERE user_id=?
+                SET referral_bonus_days =
+                    referral_bonus_days + %s
+                WHERE user_id=%s
                 """,
                 (
                     reward_days,
@@ -1582,10 +1707,6 @@ async def reward_referrer_for_purchase(
             )
 
             conn.commit()
-
-    # ---------------------------------------------
-    # Сообщение рефереру
-    # ---------------------------------------------
 
     try:
 
@@ -1603,223 +1724,7 @@ async def reward_referrer_for_purchase(
     except TelegramError:
         pass
 
-    logger.info(
-        "REFERRAL REWARDED: "
-        "referrer=%s referred=%s days=%s",
-        referrer_id,
-        referred_user_id,
-        reward_days
-    )
-
     return True
-
-
-# =========================================================
-# DAILY LIMIT
-# =========================================================
-
-def request_usage(
-    user_id: int
-) -> tuple[bool, int]:
-
-    today = (
-        datetime.now(
-            timezone.utc
-        )
-        .date()
-        .isoformat()
-    )
-
-    with db() as conn:
-
-        row = conn.execute(
-            """
-            SELECT requests
-            FROM daily_usage
-            WHERE user_id=?
-            AND usage_date=?
-            """,
-            (
-                user_id,
-                today
-            )
-        ).fetchone()
-
-        used = (
-            int(row["requests"])
-            if row
-            else 0
-        )
-
-        if used >= 50:
-            return False, used
-
-        if row:
-
-            conn.execute(
-                """
-                UPDATE daily_usage
-                SET requests=requests+1
-                WHERE user_id=?
-                AND usage_date=?
-                """,
-                (
-                    user_id,
-                    today
-                )
-            )
-
-        else:
-
-            conn.execute(
-                """
-                INSERT INTO daily_usage(
-                    user_id,
-                    usage_date,
-                    requests
-                )
-                VALUES(
-                    ?,
-                    ?,
-                    1
-                )
-                """,
-                (
-                    user_id,
-                    today
-                )
-            )
-
-        conn.commit()
-
-    return True, used + 1
-
-
-def usage_today(
-    user_id: int
-) -> int:
-
-    today = (
-        datetime.now(
-            timezone.utc
-        )
-        .date()
-        .isoformat()
-    )
-
-    with db() as conn:
-
-        row = conn.execute(
-            """
-            SELECT requests
-            FROM daily_usage
-            WHERE user_id=?
-            AND usage_date=?
-            """,
-            (
-                user_id,
-                today
-            )
-        ).fetchone()
-
-    if not row:
-        return 0
-
-    return int(
-        row["requests"]
-    )
-
-
-# =========================================================
-# HUGS / CHECKS
-# =========================================================
-
-def add_check(
-    user_id: int
-):
-    with db() as conn:
-
-        conn.execute(
-            """
-            UPDATE profiles
-            SET checks=checks+1
-            WHERE user_id=?
-            """,
-            (user_id,)
-        )
-
-        conn.commit()
-
-
-def add_hug(
-    user_id: int,
-    target: str,
-    count: int
-):
-    with db() as conn:
-
-        conn.execute(
-            """
-            INSERT INTO hugs(
-                user_id,
-                target,
-                count,
-                created_at
-            )
-            VALUES(
-                ?,
-                ?,
-                ?,
-                ?
-            )
-            """,
-            (
-                user_id,
-                target,
-                count,
-                datetime.now().strftime(
-                    "%d.%m.%Y %H:%M"
-                )
-            )
-        )
-
-        conn.execute(
-            """
-            UPDATE profiles
-            SET warmth=MIN(
-                1000,
-                warmth+10
-            )
-            WHERE user_id=?
-            """,
-            (user_id,)
-        )
-
-        conn.commit()
-
-
-def get_history(
-    user_id: int,
-    limit: int = 10
-):
-    with db() as conn:
-
-        return conn.execute(
-            """
-            SELECT
-                target,
-                count,
-                created_at
-            FROM hugs
-            WHERE user_id=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (
-                user_id,
-                limit
-            )
-        ).fetchall()
 
 
 # =========================================================
@@ -1846,7 +1751,7 @@ def redeem_promo(
             """
             SELECT *
             FROM promo_codes
-            WHERE code=?
+            WHERE code=%s
             """,
             (code,)
         ).fetchone()
@@ -1854,7 +1759,7 @@ def redeem_promo(
         if not row:
             return "invalid", None
 
-        if not int(row["active"]):
+        if not row["active"]:
             return "invalid", None
 
         plan = row["plan"]
@@ -1866,8 +1771,8 @@ def redeem_promo(
             """
             SELECT 1
             FROM promo_redemptions
-            WHERE code=?
-            AND user_id=?
+            WHERE code=%s
+              AND user_id=%s
             """,
             (
                 code,
@@ -1882,19 +1787,18 @@ def redeem_promo(
 
         if (
             max_uses is not None
-            and int(row["used"]) >= int(max_uses)
+            and int(row["used"])
+            >= int(max_uses)
         ):
             return "exhausted", None
 
-        now = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+        now = datetime.now(
+            timezone.utc
         )
 
         try:
 
-            conn.execute(
+            inserted = conn.execute(
                 """
                 INSERT INTO promo_redemptions(
                     code,
@@ -1902,34 +1806,103 @@ def redeem_promo(
                     redeemed_at
                 )
                 VALUES(
-                    ?,
-                    ?,
-                    ?
+                    %s,
+                    %s,
+                    %s
                 )
+                ON CONFLICT(
+                    code,
+                    user_id
+                )
+                DO NOTHING
+                RETURNING code
                 """,
                 (
                     code,
                     user_id,
                     now
                 )
-            )
+            ).fetchone()
+
+            if not inserted:
+
+                conn.rollback()
+
+                return (
+                    "already",
+                    None
+                )
 
             conn.execute(
                 """
                 UPDATE promo_codes
                 SET used=used+1
-                WHERE code=?
+                WHERE code=%s
                 """,
                 (code,)
             )
 
             conn.commit()
 
-        except sqlite3.IntegrityError:
+        except Exception:
 
-            return "already", None
+            conn.rollback()
+
+            raise
 
     return "ok", plan
+
+
+async def apply_promo_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    raw_code: str
+) -> bool:
+
+    status, plan = redeem_promo(
+        user_id,
+        raw_code
+    )
+
+    if status == "empty":
+
+        await update.message.reply_text(
+            "Введите промокод.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    if status == "invalid":
+        return False
+
+    if status == "already":
+
+        await update.message.reply_text(
+            "❌ Вы уже использовали этот промокод.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    if status == "exhausted":
+
+        await update.message.reply_text(
+            "❌ Этот промокод больше недоступен.",
+            reply_markup=kb_profile()
+        )
+
+        return True
+
+    await grant_promo_access(
+        context.bot,
+        user_id,
+        plan,
+        raw_code.strip().upper()
+    )
+
+    return True
 
 
 # =========================================================
@@ -1970,6 +1943,7 @@ def kb_home(
         user_id is not None
         and is_admin(user_id)
     ):
+
         rows.append([
             InlineKeyboardButton(
                 "🛠 Админ-панель",
@@ -2310,8 +2284,10 @@ async def is_required_channel_member(
     except TelegramError as exc:
 
         logger.error(
-            "Required channel check failed: "
-            "channel=%s user=%s error=%s",
+            (
+                "Required channel check failed: "
+                "channel=%s user=%s error=%s"
+            ),
             REQUIRED_CHANNEL_ID,
             user_id,
             exc
@@ -2336,12 +2312,6 @@ async def channel_gate(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    Отдельная обязательная подписка на канал.
-
-    Она НЕ влияет на таблицу subscriptions.
-    """
-
     if not REQUIRED_CHANNEL_ID:
         return
 
@@ -2350,32 +2320,36 @@ async def channel_gate(
     if not user or user.is_bot:
         return
 
-    # Админ не блокируется обязательной подпиской
+    # Админ не блокируется
     if is_admin(user.id):
         return
 
     q = update.callback_query
 
-    # -----------------------------------------------------
-    # Проверка кнопкой
-    # -----------------------------------------------------
+    # ---------------------------------------------
+    # CHECK SUB
+    # ---------------------------------------------
 
     if (
         q
         and q.data == "gate:check"
     ):
 
-        subscribed = await is_required_channel_member(
-            context.bot,
-            user.id
+        subscribed = (
+            await is_required_channel_member(
+                context.bot,
+                user.id
+            )
         )
 
         if subscribed:
 
             try:
+
                 await q.answer(
                     "Подписка найдена ✅"
                 )
+
             except TelegramError:
                 pass
 
@@ -2387,10 +2361,12 @@ async def channel_gate(
         else:
 
             try:
+
                 await q.answer(
                     "Вы ещё не подписались.",
                     show_alert=True
                 )
+
             except TelegramError:
                 pass
 
@@ -2401,26 +2377,16 @@ async def channel_gate(
 
         raise ApplicationHandlerStop
 
-    # -----------------------------------------------------
-    # Не блокируем оплату Stars
-    # -----------------------------------------------------
-
+    # Не блокируем Stars
     if update.pre_checkout_query:
         return
 
-    # -----------------------------------------------------
-    # Не блокируем успешную оплату
-    # -----------------------------------------------------
-
+    # Не блокируем successful_payment
     if (
         update.message
         and update.message.successful_payment
     ):
         return
-
-    # -----------------------------------------------------
-    # Проверка
-    # -----------------------------------------------------
 
     if await is_required_channel_member(
         context.bot,
@@ -2431,10 +2397,12 @@ async def channel_gate(
     if q:
 
         try:
+
             await q.answer(
                 "Сначала подпишитесь на канал.",
                 show_alert=True
             )
+
         except TelegramError:
             pass
 
@@ -2457,6 +2425,7 @@ async def safe_delete(
         return
 
     try:
+
         await message.delete()
 
     except TelegramError:
@@ -2471,7 +2440,9 @@ async def send_ui(
     photo: Path | None = None,
     replace: bool = True
 ):
-    chat_id = update.effective_chat.id
+    chat_id = (
+        update.effective_chat.id
+    )
 
     q = update.callback_query
 
@@ -2496,8 +2467,9 @@ async def send_ui(
 
                 try:
 
-                    # Фото и текст в ОДНОМ сообщении.
-                    # Caption находится СВЕРХУ фото.
+                    # Фото + caption
+                    # ОДНО сообщение.
+                    # Caption над фото.
                     await context.bot.send_photo(
                         chat_id=chat_id,
                         photo=fh,
@@ -2509,7 +2481,7 @@ async def send_ui(
                 except TypeError:
 
                     # Совместимость со старой
-                    # версией python-telegram-bot.
+                    # версией PTB.
                     await context.bot.send_photo(
                         chat_id=chat_id,
                         photo=fh,
@@ -2670,27 +2642,19 @@ def profile_caption(
 
     if profile["sub"]:
 
-        try:
+        expires_at = (
+            profile["sub"]["expires_at"]
+        )
 
-            expires_at = datetime.fromisoformat(
-                profile["sub"]["expires_at"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(
+                tzinfo=timezone.utc
             )
 
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            expires_text = (
-                "\n⏳ До: "
-                f"{expires_at.strftime('%d.%m.%Y %H:%M')}"
-            )
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            pass
+        expires_text = (
+            "\n⏳ До: "
+            f"{expires_at.strftime('%d.%m.%Y %H:%M')}"
+        )
 
     bonus_days = get_referral_bonus_days(
         user_id
@@ -2701,7 +2665,7 @@ def profile_caption(
     if bonus_days > 0:
 
         bonus_text = (
-            f"\n🎁 Бонус рефералов — "
+            f"\n🎁 Реферальный бонус — "
             f"+{bonus_days} д."
         )
 
@@ -2738,23 +2702,15 @@ async def run_hug_animation(
     """
     Первое сообщение уже отправлено
     confirm_and_send_hug().
-
-    Поэтому повторно его не отправляем.
     """
 
     count = 356
 
     try:
 
-        # -------------------------
-        # Стартовая пауза
-        # -------------------------
-
-        await asyncio.sleep(1)
-
-        # -------------------------
-        # Проценты
-        # -------------------------
+        await asyncio.sleep(
+            1
+        )
 
         progress_steps = [
             8,
@@ -2770,14 +2726,14 @@ async def run_hug_animation(
 
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"💤{percent}%💤"
+                text=(
+                    f"💤{percent}%💤"
+                )
             )
 
-            await asyncio.sleep(1)
-
-        # -------------------------
-        # 100%
-        # -------------------------
+            await asyncio.sleep(
+                1
+            )
 
         await bot.send_message(
             chat_id=chat_id,
@@ -2788,19 +2744,11 @@ async def run_hug_animation(
             0.5
         )
 
-        # -------------------------
-        # Записываем результат
-        # -------------------------
-
         add_hug(
             user_id,
             target,
             count
         )
-
-        # -------------------------
-        # Финал
-        # -------------------------
 
         await bot.send_message(
             chat_id=chat_id,
@@ -2905,10 +2853,6 @@ async def confirm_and_send_hug(
 
     q = update.callback_query
 
-    # -------------------------
-    # Кнопка подтверждения
-    # -------------------------
-
     if (
         q
         and q.message
@@ -2935,10 +2879,6 @@ async def confirm_and_send_hug(
                 msg.message_id
             )
 
-    # -------------------------
-    # Обычное сообщение
-    # -------------------------
-
     elif update.message:
 
         msg = await update.message.reply_text(
@@ -2948,10 +2888,6 @@ async def confirm_and_send_hug(
         msg_id = (
             msg.message_id
         )
-
-    # -------------------------
-    # Запасной вариант
-    # -------------------------
 
     else:
 
@@ -2963,10 +2899,6 @@ async def confirm_and_send_hug(
         msg_id = (
             msg.message_id
         )
-
-    # -------------------------
-    # Запуск анимации
-    # -------------------------
 
     context.application.create_task(
         run_hug_animation(
@@ -3111,21 +3043,23 @@ async def show_history(
 
     for row in history:
 
+        created_at = (
+            row["created_at"]
+        )
+
         lines.append(
             f"• {row['target']} — "
             f"{row['count']} "
-            f"({row['created_at']})"
+            f"({created_at.strftime('%d.%m.%Y %H:%M')})"
         )
-
-    text = (
-        "📜 История п0иска:\n\n"
-        + "\n".join(lines)
-    )
 
     await send_ui(
         update,
         context,
-        text,
+        (
+            "📜 История п0иска:\n\n"
+            + "\n".join(lines)
+        ),
         kb_menu()
     )
 
@@ -3202,7 +3136,6 @@ async def nav_callback(
     except TelegramError:
         pass
 
-    # HOME
     if data == "nav:home":
 
         await show_home(
@@ -3212,7 +3145,6 @@ async def nav_callback(
 
         return
 
-    # PROFILE
     if data == "nav:profile":
 
         await show_profile(
@@ -3222,7 +3154,6 @@ async def nav_callback(
 
         return
 
-    # MENU
     if data == "nav:menu":
 
         await show_menu(
@@ -3232,7 +3163,6 @@ async def nav_callback(
 
         return
 
-    # SUPPORT
     if data == "nav:support":
 
         await show_support(
@@ -3242,7 +3172,6 @@ async def nav_callback(
 
         return
 
-    # SUBSCRIPTION
     if data == "nav:sub":
 
         await show_subscription(
@@ -3252,7 +3181,6 @@ async def nav_callback(
 
         return
 
-    # PROMO
     if data == "nav:promo":
 
         context.user_data[
@@ -3268,7 +3196,6 @@ async def nav_callback(
 
         return
 
-    # REFERRALS
     if data == "nav:referrals":
 
         await show_referrals(
@@ -3278,7 +3205,6 @@ async def nav_callback(
 
         return
 
-    # HUG
     if data == "menu:hug":
 
         await start_hug(
@@ -3289,7 +3215,6 @@ async def nav_callback(
 
         return
 
-    # SEARCH
     if data == "menu:search":
 
         await do_search(
@@ -3300,7 +3225,6 @@ async def nav_callback(
 
         return
 
-    # CHECK
     if data == "menu:check":
 
         await start_check(
@@ -3311,7 +3235,6 @@ async def nav_callback(
 
         return
 
-    # HISTORY
     if data == "menu:history":
 
         await show_history(
@@ -3322,7 +3245,6 @@ async def nav_callback(
 
         return
 
-    # HUG YES
     if data == "hug:yes":
 
         if not context.user_data.get(
@@ -3349,7 +3271,6 @@ async def nav_callback(
 
         return
 
-    # HUG NO
     if data == "hug:no":
 
         context.user_data[
@@ -3375,213 +3296,127 @@ async def nav_callback(
 
 def admin_stats() -> str:
 
-    today = (
-        datetime.now(
-            timezone.utc
-        )
-        .date()
-        .isoformat()
-    )
+    today = datetime.now(
+        timezone.utc
+    ).date()
 
     with db() as conn:
 
-        # Всего пользователей
         total_users = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM profiles
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Новые сегодня
         new_today = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM profiles
-            WHERE substr(
-                first_seen_at,
-                1,
-                10
-            )=?
+            WHERE first_seen_at::date=%s
             """,
             (today,)
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Всего успешных оплат
         total_paid = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM payments
             WHERE status='paid'
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Уникальные покупатели
         unique_buyers = conn.execute(
             """
-            SELECT COUNT(DISTINCT user_id)
+            SELECT COUNT(
+                DISTINCT user_id
+            ) AS total
             FROM payments
             WHERE status='paid'
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Stars
-        stars_payments = conn.execute(
+        total_stars = conn.execute(
             """
-            SELECT plan
+            SELECT COALESCE(
+                SUM(amount),
+                0
+            ) AS total
             FROM payments
             WHERE status='paid'
-            AND method='stars'
+              AND currency='XTR'
             """
-        ).fetchall()
+        ).fetchone()["total"]
 
-        # Crypto
-        crypto_payments = conn.execute(
+        total_crypto = conn.execute(
             """
-            SELECT plan
+            SELECT COALESCE(
+                SUM(amount),
+                0
+            ) AS total
             FROM payments
             WHERE status='paid'
-            AND method='cryptobot'
-            """
-        ).fetchall()
+              AND currency=%s
+            """,
+            (CRYPTO_ASSET,)
+        ).fetchone()["total"]
 
-        # Рефералы
         total_referrals = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM referrals
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
         converted_referrals = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS total
             FROM referrals
-            WHERE rewarded=1
+            WHERE rewarded=TRUE
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Запросы сегодня
         requests_today = conn.execute(
             """
             SELECT COALESCE(
                 SUM(requests),
                 0
-            )
+            ) AS total
             FROM daily_usage
-            WHERE usage_date=?
+            WHERE usage_date=%s
             """,
             (today,)
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Всего запусков sn1c
         total_hugs = conn.execute(
             """
             SELECT COALESCE(
                 SUM(count),
                 0
-            )
+            ) AS total
             FROM hugs
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Проверки
         total_checks = conn.execute(
             """
             SELECT COALESCE(
                 SUM(checks),
                 0
-            )
+            ) AS total
             FROM profiles
             """
-        ).fetchone()[0]
+        ).fetchone()["total"]
 
-        # Все подписки
-        subscription_rows = conn.execute(
+        active_subscriptions = conn.execute(
             """
-            SELECT user_id, expires_at
+            SELECT COUNT(
+                DISTINCT user_id
+            ) AS total
             FROM subscriptions
+            WHERE expires_at > NOW()
             """
-        ).fetchall()
-
-    # -------------------------
-    # Активные подписчики
-    # -------------------------
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    active_users = set()
-
-    for row in subscription_rows:
-
-        try:
-
-            expires_at = datetime.fromisoformat(
-                row["expires_at"]
-            )
-
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            if expires_at > now:
-
-                active_users.add(
-                    row["user_id"]
-                )
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            continue
-
-    active_subscriptions = len(
-        active_users
-    )
-
-    # -------------------------
-    # Stars revenue
-    # -------------------------
-
-    total_stars = 0
-
-    for row in stars_payments:
-
-        plan = row["plan"]
-
-        if plan in PLANS:
-            total_stars += int(
-                PLANS[plan]["stars"]
-            )
-
-    # -------------------------
-    # Crypto revenue
-    # -------------------------
-
-    total_crypto_usd = 0.0
-
-    for row in crypto_payments:
-
-        plan = row["plan"]
-
-        if plan not in PLANS:
-            continue
-
-        try:
-
-            total_crypto_usd += float(
-                PLANS[plan]["usd"] or 0
-            )
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            pass
+        ).fetchone()["total"]
 
     return (
         "🛠 АДМИН-ПАНЕЛЬ\n\n"
@@ -3591,19 +3426,23 @@ def admin_stats() -> str:
         f"• Сегодня — {new_today}\n\n"
 
         "💎 Подписки\n"
-        f"• Активных — {active_subscriptions}\n"
-        f"• Всего оплат — {total_paid}\n"
+        f"• Активных — "
+        f"{active_subscriptions}\n"
+        f"• Всего оплат — "
+        f"{total_paid}\n"
         f"• Уникальных покупателей — "
         f"{unique_buyers}\n\n"
 
         "💰 ОПЛАТЫ\n"
-        f"• Telegram Stars — "
-        f"{total_stars}⭐\n"
+        f"• Stars — "
+        f"{int(total_stars or 0)}⭐\n"
         f"• CryptoBot — "
-        f"{total_crypto_usd:.2f}$\n\n"
+        f"{float(total_crypto or 0):.2f} "
+        f"{CRYPTO_ASSET}\n\n"
 
         "🔗 Рефералы\n"
-        f"• Всего — {total_referrals}\n"
+        f"• Всего — "
+        f"{total_referrals}\n"
         f"• Конвертировано — "
         f"{converted_referrals}\n\n"
 
@@ -3625,9 +3464,7 @@ async def show_admin_panel(
         update.effective_user.id
     )
 
-    if not is_admin(
-        user_id
-    ):
+    if not is_admin(user_id):
 
         await send_ui(
             update,
@@ -3681,9 +3518,13 @@ async def show_admin_users(
 
         for row in rows:
 
+            first_seen = (
+                row["first_seen_at"]
+            )
+
             lines.append(
                 f"• {row['user_id']}\n"
-                f"  {row['first_seen_at']}"
+                f"  {first_seen.strftime('%d.%m.%Y %H:%M')}"
             )
 
         text = "\n".join(
@@ -3714,6 +3555,8 @@ async def show_admin_payments(
                 user_id,
                 plan,
                 method,
+                amount,
+                currency,
                 status,
                 created_at
             FROM payments
@@ -3737,18 +3580,49 @@ async def show_admin_payments(
         for row in rows:
 
             if row["status"] == "paid":
+
                 status = "✅"
+
             elif row["status"] == "pending":
+
                 status = "⏳"
+
             else:
+
                 status = "❌"
+
+            amount = row["amount"]
+
+            if amount is not None:
+
+                if row["currency"] == "XTR":
+
+                    price = (
+                        f"{int(amount)}⭐"
+                    )
+
+                else:
+
+                    price = (
+                        f"{float(amount):g} "
+                        f"{row['currency'] or ''}"
+                    )
+
+            else:
+
+                price = "—"
+
+            created_at = (
+                row["created_at"]
+            )
 
             lines.append(
                 f"{status} "
                 f"{row['user_id']} | "
                 f"{row['plan']} | "
                 f"{row['method']}\n"
-                f"   {row['created_at']}"
+                f"   {price} | "
+                f"{created_at.strftime('%d.%m.%Y %H:%M')}"
             )
 
         text = "\n".join(
@@ -3806,11 +3680,15 @@ async def show_admin_referrals(
                 else "⏳"
             )
 
+            created_at = (
+                row["created_at"]
+            )
+
             lines.append(
                 f"{reward} "
                 f"{row['referrer_id']} → "
                 f"{row['referred_id']}\n"
-                f"   {row['created_at']}"
+                f"   {created_at.strftime('%d.%m.%Y %H:%M')}"
             )
 
         text = "\n".join(
@@ -3844,17 +3722,21 @@ async def admin_callback(
     ):
 
         try:
+
             await q.answer(
                 "Доступ запрещён.",
                 show_alert=True
             )
+
         except TelegramError:
             pass
 
         return
 
     try:
+
         await q.answer()
+
     except TelegramError:
         pass
 
@@ -3909,7 +3791,7 @@ async def admin_callback(
 
 
 # =========================================================
-# ACCESS / INVITE
+# ACCESS / CHANNEL INVITE
 # =========================================================
 
 async def issue_channel_invite(
@@ -3927,8 +3809,10 @@ async def issue_channel_invite(
     if not channel:
 
         logger.error(
-            "CHANNEL NOT CONFIGURED: "
-            "plan=%s user=%s",
+            (
+                "CHANNEL NOT CONFIGURED: "
+                "plan=%s user=%s"
+            ),
             plan,
             user_id
         )
@@ -3936,16 +3820,18 @@ async def issue_channel_invite(
         return None, "no_channel"
 
     logger.info(
-        "Channel invite: "
-        "plan=%s channel=%s user=%s",
+        (
+            "Channel invite: "
+            "plan=%s channel=%s user=%s"
+        ),
         plan,
         channel,
         user_id
     )
 
-    # -------------------------
-    # Проверка участника
-    # -------------------------
+    # ---------------------------------------------
+    # Уже участник
+    # ---------------------------------------------
 
     try:
 
@@ -3968,65 +3854,63 @@ async def issue_channel_invite(
     except TelegramError as exc:
 
         logger.warning(
-            "Could not check channel member: "
-            "plan=%s channel=%s user=%s "
-            "error=%s",
+            (
+                "Could not check channel member: "
+                "plan=%s channel=%s user=%s "
+                "error=%s"
+            ),
             plan,
             channel,
             user_id,
             exc
         )
 
-    # -------------------------
-    # Дата окончания ссылки
-    # -------------------------
+    # ---------------------------------------------
+    # Срок ссылки
+    # ---------------------------------------------
 
-    subscription = get_active_subscription(
-        user_id
+    subscription = (
+        get_active_subscription(
+            user_id
+        )
     )
 
     expire_date = None
 
     if subscription:
 
-        try:
+        expire_date = (
+            subscription["expires_at"]
+        )
 
-            expires_at = datetime.fromisoformat(
-                subscription["expires_at"]
+        if expire_date.tzinfo is None:
+            expire_date = expire_date.replace(
+                tzinfo=timezone.utc
             )
 
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(
-                    tzinfo=timezone.utc
-                )
-
-            expire_date = expires_at
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            pass
-
-    # -------------------------
-    # Создание ссылки
-    # -------------------------
+    # ---------------------------------------------
+    # Create invite
+    # ---------------------------------------------
 
     try:
 
-        invite = await bot.create_chat_invite_link(
-            chat_id=channel,
-            name=(
-                f"user {user_id} "
-                f"{plan}"
-            ),
-            member_limit=1,
-            expire_date=expire_date
+        invite = (
+            await bot.create_chat_invite_link(
+                chat_id=channel,
+                name=(
+                    f"user {user_id} "
+                    f"{plan}"
+                ),
+                member_limit=1,
+                expire_date=expire_date
+            )
         )
 
         logger.info(
-            "Invite link created: "
-            "plan=%s channel=%s user=%s",
+            (
+                "Invite link created: "
+                "plan=%s channel=%s user=%s"
+            ),
             plan,
             channel,
             user_id
@@ -4040,9 +3924,11 @@ async def issue_channel_invite(
     except BadRequest as exc:
 
         logger.error(
-            "CHANNEL INVITE FAILED: "
-            "plan=%s channel=%s user=%s "
-            "error=%s",
+            (
+                "CHANNEL INVITE FAILED: "
+                "plan=%s channel=%s user=%s "
+                "error=%s"
+            ),
             plan,
             channel,
             user_id,
@@ -4054,9 +3940,11 @@ async def issue_channel_invite(
     except TelegramError as exc:
 
         logger.error(
-            "CHANNEL INVITE TELEGRAM ERROR: "
-            "plan=%s channel=%s user=%s "
-            "error=%s",
+            (
+                "CHANNEL INVITE TELEGRAM ERROR: "
+                "plan=%s channel=%s user=%s "
+                "error=%s"
+            ),
             plan,
             channel,
             user_id,
@@ -4071,6 +3959,7 @@ def access_granted_text(
     expires: datetime,
     invite_status: str
 ):
+
     if expires.tzinfo is None:
         expires = expires.replace(
             tzinfo=timezone.utc
@@ -4110,7 +3999,6 @@ def access_granted_text(
     return text
 
 
-# Защита от повторной отправки
 _notified_payments: set[str] = set()
 
 
@@ -4122,38 +4010,27 @@ async def grant_paid_access(
     payment_key: str,
     payment_db_id: int | None = None
 ):
-    # -------------------------
-    # Если уже есть такая подписка
-    # -------------------------
+    # ---------------------------------------------
+    # Уже существует
+    # ---------------------------------------------
 
-    existing = find_subscription_by_payment(
-        payment_key
+    existing = (
+        find_subscription_by_payment(
+            payment_key
+        )
     )
 
     if existing:
 
-        try:
+        expires = (
+            existing["expires_at"]
+        )
 
-            expires = datetime.fromisoformat(
-                existing["expires_at"]
-            )
+        return expires
 
-            if expires.tzinfo is None:
-                expires = expires.replace(
-                    tzinfo=timezone.utc
-                )
-
-            return expires
-
-        except (
-            ValueError,
-            TypeError
-        ):
-            return None
-
-    # -------------------------
-    # Защита от дубля события
-    # -------------------------
+    # ---------------------------------------------
+    # Защита от повторного события
+    # ---------------------------------------------
 
     if payment_key in _notified_payments:
 
@@ -4168,9 +4045,9 @@ async def grant_paid_access(
         payment_key
     )
 
-    # -------------------------
-    # Обновляем payment
-    # -------------------------
+    # ---------------------------------------------
+    # Payment
+    # ---------------------------------------------
 
     if payment_db_id:
 
@@ -4180,9 +4057,9 @@ async def grant_paid_access(
             payment_key
         )
 
-    # -------------------------
-    # Создаём подписку
-    # -------------------------
+    # ---------------------------------------------
+    # Subscription
+    # ---------------------------------------------
 
     expires = activate_subscription(
         user_id,
@@ -4191,18 +4068,18 @@ async def grant_paid_access(
         payment_key
     )
 
-    # -------------------------
-    # Реферальный бонус
-    # -------------------------
+    # ---------------------------------------------
+    # Referral
+    # ---------------------------------------------
 
     await reward_referrer_for_purchase(
         bot,
         user_id
     )
 
-    # -------------------------
-    # Канал
-    # -------------------------
+    # ---------------------------------------------
+    # Channel
+    # ---------------------------------------------
 
     link, invite_status = (
         await issue_channel_invite(
@@ -4247,20 +4124,17 @@ async def grant_promo_access(
         f"{user_id}"
     )
 
-    existing = find_subscription_by_payment(
-        payment_key
+    existing = (
+        find_subscription_by_payment(
+            payment_key
+        )
     )
 
     if existing:
 
-        expires = datetime.fromisoformat(
+        expires = (
             existing["expires_at"]
         )
-
-        if expires.tzinfo is None:
-            expires = expires.replace(
-                tzinfo=timezone.utc
-            )
 
     else:
 
@@ -4313,64 +4187,6 @@ async def grant_promo_access(
 
 
 # =========================================================
-# PROMO TEXT
-# =========================================================
-
-async def apply_promo_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    raw_code: str
-) -> bool:
-
-    status, plan = redeem_promo(
-        user_id,
-        raw_code
-    )
-
-    if status == "empty":
-
-        await update.message.reply_text(
-            "Введите промокод.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    if status == "invalid":
-        return False
-
-    if status == "already":
-
-        await update.message.reply_text(
-            "❌ Вы уже использовали "
-            "этот промокод.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    if status == "exhausted":
-
-        await update.message.reply_text(
-            "❌ Этот промокод больше "
-            "недоступен.",
-            reply_markup=kb_profile()
-        )
-
-        return True
-
-    await grant_promo_access(
-        context.bot,
-        user_id,
-        plan,
-        raw_code.strip().upper()
-    )
-
-    return True
-
-
-# =========================================================
 # CRYPTO API
 # =========================================================
 
@@ -4379,6 +4195,7 @@ async def crypto_api(
     payload: dict
 ):
     if not CRYPTO_PAY_API_TOKEN:
+
         raise RuntimeError(
             "CRYPTO_PAY_API_TOKEN "
             "is not configured"
@@ -4426,6 +4243,7 @@ async def create_crypto_invoice(
     plan: str
 ):
     if plan not in PLANS:
+
         raise ValueError(
             f"Unknown plan: {plan}"
         )
@@ -4433,9 +4251,12 @@ async def create_crypto_invoice(
     amount = PLANS[plan]["usd"]
 
     if not amount:
+
         raise RuntimeError(
-            "USD price is not configured "
-            f"for plan={plan}"
+            (
+                "USD price is not configured "
+                f"for plan={plan}"
+            )
         )
 
     payload_id = (
@@ -4460,7 +4281,10 @@ async def create_crypto_invoice(
         }
     )
 
-    return result, payload_id
+    return (
+        result,
+        payload_id
+    )
 
 
 async def crypto_watch(
@@ -4558,7 +4382,9 @@ async def subscription_callback(
     except TelegramError:
         pass
 
-    user_id = q.from_user.id
+    user_id = (
+        q.from_user.id
+    )
 
     data = q.data
 
@@ -4597,10 +4423,12 @@ async def subscription_callback(
 
         text = (
             f"💎 {p['title']}\n\n"
-            f"⏳ Срок — {p['days']} дней\n"
-            f"💵 Цена — {price_text}\n\n"
-            "После оплаты подписка выдаётся "
-            "автоматически.\n\n"
+            f"⏳ Срок — "
+            f"{p['days']} дней\n"
+            f"💵 Цена — "
+            f"{price_text}\n\n"
+            "После оплаты подписка "
+            "выдаётся автоматически.\n\n"
             "Выберите способ оплаты:"
         )
 
@@ -4627,7 +4455,7 @@ async def subscription_callback(
         return
 
     # =====================================================
-    # CRYPTOBOT
+    # CRYPTO
     # =====================================================
 
     if data.startswith(
@@ -4639,24 +4467,26 @@ async def subscription_callback(
         if plan not in PLANS:
             return
 
-        # -------------------------
-        # Fallback links
-        # -------------------------
-
         fallback = None
 
         if plan == "week":
-            fallback = CRYPTO_FALLBACK_WEEK
+            fallback = (
+                CRYPTO_FALLBACK_WEEK
+            )
 
         elif plan == "month":
-            fallback = CRYPTO_FALLBACK_MONTH
+            fallback = (
+                CRYPTO_FALLBACK_MONTH
+            )
 
         elif plan == "year":
-            fallback = CRYPTO_FALLBACK_YEAR
+            fallback = (
+                CRYPTO_FALLBACK_YEAR
+            )
 
-        # -------------------------
-        # API token отсутствует
-        # -------------------------
+        # ---------------------------------------------
+        # Token отсутствует
+        # ---------------------------------------------
 
         if not CRYPTO_PAY_API_TOKEN:
 
@@ -4714,9 +4544,9 @@ async def subscription_callback(
 
             return
 
-        # -------------------------
-        # API
-        # -------------------------
+        # ---------------------------------------------
+        # API invoice
+        # ---------------------------------------------
 
         try:
 
@@ -4732,10 +4562,16 @@ async def subscription_callback(
             )
 
             payment_db_id = create_payment(
-                user_id,
-                plan,
-                "cryptobot",
-                str(invoice_id)
+                user_id=user_id,
+                plan=plan,
+                method="cryptobot",
+                external_id=str(
+                    invoice_id
+                ),
+                amount=float(
+                    PLANS[plan]["usd"]
+                ),
+                currency=CRYPTO_ASSET
             )
 
             url = (
@@ -4751,6 +4587,7 @@ async def subscription_callback(
             )
 
             if not url:
+
                 raise RuntimeError(
                     "CryptoBot did not return "
                     "invoice URL"
@@ -4824,7 +4661,7 @@ async def subscription_callback(
         return
 
     # =====================================================
-    # TELEGRAM STARS
+    # STARS
     # =====================================================
 
     if data.startswith(
@@ -4839,10 +4676,12 @@ async def subscription_callback(
         p = PLANS[plan]
 
         payment_db_id = create_payment(
-            user_id,
-            plan,
-            "stars",
-            None
+            user_id=user_id,
+            plan=plan,
+            method="stars",
+            external_id=None,
+            amount=p["stars"],
+            currency="XTR"
         )
 
         context.user_data[
@@ -4910,8 +4749,7 @@ async def subscription_callback(
             await context.bot.send_message(
                 user_id,
                 (
-                    "❌ Не удалось создать "
-                    "счёт Stars.\n\n"
+                    "❌ Не удалось создать счёт Stars.\n\n"
                     "Попробуйте CryptoBot."
                 ),
                 reply_markup=kb_pay_methods(plan)
@@ -4950,9 +4788,7 @@ async def subscription_callback(
         try:
 
             invoice_id = parts[1]
-
             plan = parts[2]
-
             payment_db_id = int(
                 parts[3]
             )
@@ -4975,8 +4811,10 @@ async def subscription_callback(
         if plan not in PLANS:
             return
 
-        existing = find_subscription_by_payment(
-            str(invoice_id)
+        existing = (
+            find_subscription_by_payment(
+                str(invoice_id)
+            )
         )
 
         if existing:
@@ -4993,10 +4831,12 @@ async def subscription_callback(
         if not CRYPTO_PAY_API_TOKEN:
 
             try:
+
                 await q.answer(
                     "Автопроверка не настроена.",
                     show_alert=True
                 )
+
             except TelegramError:
                 pass
 
@@ -5039,6 +4879,7 @@ async def subscription_callback(
                 return
 
             try:
+
                 await q.answer(
                     (
                         "Оплата ещё не найдена.\n"
@@ -5046,6 +4887,7 @@ async def subscription_callback(
                     ),
                     show_alert=True
                 )
+
             except TelegramError:
                 pass
 
@@ -5056,10 +4898,12 @@ async def subscription_callback(
             )
 
             try:
+
                 await q.answer(
                     "Не удалось проверить оплату.",
                     show_alert=True
                 )
+
             except TelegramError:
                 pass
 
@@ -5073,22 +4917,19 @@ async def subscription_callback(
         "manual_crypto:"
     ):
 
-        plan = data.split(":")[-1]
-
         await send_ui(
             update,
             context,
             (
-                "⏳ Автоматическая проверка "
-                "доступна после настройки "
-                "CRYPTO_PAY_API_TOKEN."
+                "⏳ Для автоматической проверки "
+                "настройте CRYPTO_PAY_API_TOKEN."
             ),
             kb_back_home()
         )
 
 
 # =========================================================
-# STARS PRECHECKOUT
+# STARS
 # =========================================================
 
 async def pre_checkout(
@@ -5134,10 +4975,6 @@ async def pre_checkout(
             "Pre checkout error"
         )
 
-
-# =========================================================
-# SUCCESSFUL STARS PAYMENT
-# =========================================================
 
 async def successful_payment(
     update: Update,
@@ -5224,7 +5061,7 @@ async def successful_payment(
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 async def cmd_start(
@@ -5240,7 +5077,7 @@ async def cmd_start(
     )
 
     # ---------------------------------------------
-    # Реферальная ссылка
+    # REFERRAL
     # ---------------------------------------------
 
     if context.args:
@@ -5274,8 +5111,7 @@ async def cmd_start(
                 )
 
     # ---------------------------------------------
-    # Проверяем существующую подписку,
-    # но НЕ меняем её
+    # Subscription does NOT reset
     # ---------------------------------------------
 
     subscription = (
@@ -5287,8 +5123,10 @@ async def cmd_start(
     if subscription:
 
         logger.info(
-            "START: active subscription "
-            "user=%s plan=%s expires=%s",
+            (
+                "START: active subscription "
+                "user=%s plan=%s expires=%s"
+            ),
             user_id,
             subscription["plan"],
             subscription["expires_at"]
@@ -5297,8 +5135,10 @@ async def cmd_start(
     else:
 
         logger.info(
-            "START: no active subscription "
-            "user=%s",
+            (
+                "START: no active subscription "
+                "user=%s"
+            ),
             user_id
         )
 
@@ -5318,14 +5158,12 @@ async def cmd_start(
 
     await update.message.reply_text(
         GREETING,
-        reply_markup=kb_home(
-            user_id
-        )
+        reply_markup=kb_home(user_id)
     )
 
 
 # =========================================================
-# /ADMIN
+# ADMIN COMMAND
 # =========================================================
 
 async def cmd_admin(
@@ -5379,9 +5217,9 @@ async def handle_text(
         "state"
     )
 
-    # =====================================================
+    # ---------------------------------------------
     # HUG TARGET
-    # =====================================================
+    # ---------------------------------------------
 
     if state == "awaiting_hug_target":
 
@@ -5403,9 +5241,9 @@ async def handle_text(
 
         return
 
-    # =====================================================
+    # ---------------------------------------------
     # CONFIRM
-    # =====================================================
+    # ---------------------------------------------
 
     if state == "awaiting_confirm":
 
@@ -5416,9 +5254,9 @@ async def handle_text(
 
         return
 
-    # =====================================================
+    # ---------------------------------------------
     # PROMO
-    # =====================================================
+    # ---------------------------------------------
 
     if state == "awaiting_promo":
 
@@ -5442,9 +5280,9 @@ async def handle_text(
 
         return
 
-    # =====================================================
+    # ---------------------------------------------
     # CHECK
-    # =====================================================
+    # ---------------------------------------------
 
     if state == "awaiting_check_target":
 
@@ -5461,9 +5299,9 @@ async def handle_text(
 
         return
 
-    # =====================================================
+    # ---------------------------------------------
     # SEARCH
-    # =====================================================
+    # ---------------------------------------------
 
     if state == "awaiting_search":
 
@@ -5508,9 +5346,9 @@ async def handle_text(
 
         return
 
-    # =====================================================
+    # ---------------------------------------------
     # PROMO WITHOUT STATE
-    # =====================================================
+    # ---------------------------------------------
 
     applied = await apply_promo_text(
         update,
@@ -5524,9 +5362,7 @@ async def handle_text(
 
     await update.message.reply_text(
         "Не понимаю 🙈 Воспользуйтесь меню.",
-        reply_markup=kb_home(
-            user_id
-        )
+        reply_markup=kb_home(user_id)
     )
 
 
@@ -5562,8 +5398,10 @@ async def remove_from_channels(
         except TelegramError as exc:
 
             logger.warning(
-                "Could not remove expired "
-                "user=%s from channel=%s: %s",
+                (
+                    "Could not remove expired "
+                    "user=%s from channel=%s: %s"
+                ),
                 user_id,
                 channel,
                 exc
@@ -5586,9 +5424,20 @@ async def expiration_loop(
                     """
                 ).fetchall()
 
+            checked = set()
+
             for row in rows:
 
-                user_id = row["user_id"]
+                user_id = (
+                    row["user_id"]
+                )
+
+                if user_id in checked:
+                    continue
+
+                checked.add(
+                    user_id
+                )
 
                 if not has_subscription(
                     user_id
@@ -5637,8 +5486,7 @@ def main():
     init_db()
 
     logger.info(
-        "Database initialized: %s",
-        DB_PATH
+        "Database ready: PostgreSQL/Supabase"
     )
 
     app = (
@@ -5672,7 +5520,7 @@ def main():
     )
 
     # =====================================================
-    # ADMIN COMMAND
+    # ADMIN
     # =====================================================
 
     app.add_handler(
@@ -5681,10 +5529,6 @@ def main():
             cmd_admin
         )
     )
-
-    # =====================================================
-    # ADMIN CALLBACKS
-    # =====================================================
 
     app.add_handler(
         CallbackQueryHandler(
