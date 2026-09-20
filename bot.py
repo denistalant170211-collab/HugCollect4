@@ -78,6 +78,34 @@ WEBHOOK_BASE = (
 
 
 # =========================================================
+# ADMIN
+# =========================================================
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get(
+        "ADMIN_IDS",
+        ""
+    ).split(",")
+    if x.strip().isdigit()
+}
+
+
+REFERRAL_REWARD_DAYS = int(
+    os.environ.get(
+        "REFERRAL_REWARD_DAYS",
+        "1"
+    )
+)
+
+
+def is_admin(
+    user_id: int
+) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# =========================================================
 # PATHS
 # =========================================================
 
@@ -117,13 +145,18 @@ MENU_BANNER = (
 # DATABASE
 # =========================================================
 
-# Если на Render подключен Persistent Disk
-# с Mount Path /var/data, автоматически используем
-# базу там.
+# Если на Render будет Persistent Disk:
 #
-# Можно также явно указать:
+# /var/data
+#
+# база автоматически будет:
+#
+# /var/data/hugcollect.db
+#
+# Можно также задать вручную:
 #
 # DB_PATH=/var/data/hugcollect.db
+
 
 RENDER_DATA_DIR = Path(
     "/var/data"
@@ -202,6 +235,12 @@ CRYPTO_FALLBACK_YEAR = os.environ.get(
 ).strip()
 
 
+YEAR_PRICE_USD = os.environ.get(
+    "YEAR_PRICE_USD",
+    ""
+).strip()
+
+
 # =========================================================
 # CHANNELS
 # =========================================================
@@ -256,11 +295,10 @@ PLANS = {
         "title": "Недельная подписка",
         "days": 7,
 
-        # Старую цену CryptoBot оставляем
-        # как была.
+        # CryptoBot
         "usd": "5",
 
-        # НОВАЯ ЦЕНА STARS
+        # Telegram Stars
         "stars": 200,
 
         "channel": (
@@ -273,11 +311,10 @@ PLANS = {
         "title": "Месячная подписка",
         "days": 30,
 
-        # Старую цену CryptoBot оставляем
-        # как была.
+        # CryptoBot
         "usd": "9",
 
-        # НОВАЯ ЦЕНА STARS
+        # Telegram Stars
         "stars": 350,
 
         "channel": (
@@ -290,18 +327,11 @@ PLANS = {
         "title": "Годовая подписка",
         "days": 365,
 
-        # Для года цену в долларах
-        # лучше задать отдельно через:
-        #
-        # YEAR_PRICE_USD=...
-        #
-        # Пока Stars работают независимо.
-        "usd": os.environ.get(
-            "YEAR_PRICE_USD",
-            ""
-        ).strip(),
+        # Цена CryptoBot берётся из ENV
+        # YEAR_PRICE_USD.
+        "usd": YEAR_PRICE_USD,
 
-        # НОВАЯ ЦЕНА STARS
+        # Telegram Stars
         "stars": 500,
 
         "channel": (
@@ -363,7 +393,7 @@ CHANNEL_GATE_TEXT = (
 
 
 # =========================================================
-# DATABASE INIT
+# DATABASE
 # =========================================================
 
 def db():
@@ -377,7 +407,31 @@ def db():
     return conn
 
 
+def ensure_column(
+    conn,
+    table_name: str,
+    column_name: str,
+    definition: str
+):
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+    }
+
+    if column_name not in columns:
+
+        conn.execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN {column_name} {definition}
+            """
+        )
+
+
 def init_db():
+
     with db() as conn:
 
         conn.execute(
@@ -386,6 +440,10 @@ def init_db():
             """
         )
 
+        # ---------------------------------------------
+        # PROFILES
+        # ---------------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS profiles (
@@ -393,10 +451,30 @@ def init_db():
                 level INTEGER NOT NULL DEFAULT 0,
                 warmth INTEGER NOT NULL DEFAULT 1000,
                 ref_code TEXT NOT NULL DEFAULT 'HUGGER',
-                checks INTEGER NOT NULL DEFAULT 0
+                checks INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT,
+                referral_bonus_days INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+
+        ensure_column(
+            conn,
+            "profiles",
+            "first_seen_at",
+            "TEXT"
+        )
+
+        ensure_column(
+            conn,
+            "profiles",
+            "referral_bonus_days",
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+        # ---------------------------------------------
+        # HUGS
+        # ---------------------------------------------
 
         conn.execute(
             """
@@ -409,6 +487,10 @@ def init_db():
             )
             """
         )
+
+        # ---------------------------------------------
+        # SUBSCRIPTIONS
+        # ---------------------------------------------
 
         conn.execute(
             """
@@ -425,6 +507,10 @@ def init_db():
             """
         )
 
+        # ---------------------------------------------
+        # PAYMENTS
+        # ---------------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS payments (
@@ -440,16 +526,27 @@ def init_db():
             """
         )
 
+        # ---------------------------------------------
+        # DAILY USAGE
+        # ---------------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_usage (
                 user_id INTEGER NOT NULL,
                 usage_date TEXT NOT NULL,
                 requests INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, usage_date)
+                PRIMARY KEY (
+                    user_id,
+                    usage_date
+                )
             )
             """
         )
+
+        # ---------------------------------------------
+        # META
+        # ---------------------------------------------
 
         conn.execute(
             """
@@ -459,6 +556,10 @@ def init_db():
             )
             """
         )
+
+        # ---------------------------------------------
+        # PROMO CODES
+        # ---------------------------------------------
 
         conn.execute(
             """
@@ -472,18 +573,45 @@ def init_db():
             """
         )
 
+        # ---------------------------------------------
+        # PROMO REDEMPTIONS
+        # ---------------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS promo_redemptions (
                 code TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 redeemed_at TEXT NOT NULL,
-                PRIMARY KEY (code, user_id)
+                PRIMARY KEY (
+                    code,
+                    user_id
+                )
             )
             """
         )
 
-        # Защита от повторной выдачи одной оплаты
+        # ---------------------------------------------
+        # REFERRALS
+        # ---------------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referred_id INTEGER NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                rewarded INTEGER NOT NULL DEFAULT 0,
+                rewarded_at TEXT
+            )
+            """
+        )
+
+        # ---------------------------------------------
+        # INDEXES
+        # ---------------------------------------------
+
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -500,6 +628,25 @@ def init_db():
             ON payments(external_id)
             WHERE external_id IS NOT NULL
             """
+        )
+
+        # ---------------------------------------------
+        # MIGRATION
+        # ---------------------------------------------
+
+        now_iso = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+        conn.execute(
+            """
+            UPDATE profiles
+            SET first_seen_at=?
+            WHERE first_seen_at IS NULL
+            """,
+            (now_iso,)
         )
 
         migrated = conn.execute(
@@ -531,6 +678,10 @@ def init_db():
                 )
                 """
             )
+
+        # ---------------------------------------------
+        # DEFAULT PROMO
+        # ---------------------------------------------
 
         if PROMO_CODE:
 
@@ -580,6 +731,12 @@ def init_db():
 def ensure_profile(
     user_id: int
 ):
+    now_iso = (
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
+
     with db() as conn:
 
         conn.execute(
@@ -589,17 +746,24 @@ def ensure_profile(
                 level,
                 warmth,
                 ref_code,
-                checks
+                checks,
+                first_seen_at,
+                referral_bonus_days
             )
             VALUES(
                 ?,
                 0,
                 1000,
                 'HUGGER',
+                0,
+                ?,
                 0
             )
             """,
-            (user_id,)
+            (
+                user_id,
+                now_iso
+            )
         )
 
         conn.commit()
@@ -613,16 +777,11 @@ def get_active_subscription(
     user_id: int
 ):
     """
-    ВАЖНО:
+    Все подписки пользователя достаются из SQLite,
+    после чего expires_at сравнивается Python.
 
-    SQLite не сравнивает даты подписки
-    через WHERE expires_at > ... .
-
-    Все записи пользователя загружаются,
-    после чего дата проверяется Python.
-
-    Это надёжнее для ISO datetime
-    с timezone.
+    Это позволяет избежать проблем с timezone
+    и SQLite string comparison.
     """
 
     now = datetime.now(
@@ -664,12 +823,10 @@ def get_active_subscription(
 
             logger.warning(
                 "Invalid subscription date: "
-                "user=%s expires_at=%s",
+                "user=%s value=%s",
                 user_id,
                 row["expires_at"]
             )
-
-            continue
 
     return None
 
@@ -677,7 +834,6 @@ def get_active_subscription(
 def has_subscription(
     user_id: int
 ) -> bool:
-
     return (
         get_active_subscription(
             user_id
@@ -711,7 +867,10 @@ def get_profile(
 
         sent = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COALESCE(
+                SUM(count),
+                0
+            )
             FROM hugs
             WHERE user_id=?
             """,
@@ -720,7 +879,9 @@ def get_profile(
 
     profile = dict(row)
 
-    profile["sent"] = sent
+    profile["sent"] = int(
+        sent or 0
+    )
 
     subscription = get_active_subscription(
         user_id
@@ -769,7 +930,7 @@ def get_profile(
 
 
 # =========================================================
-# PAYMENT DB
+# PAYMENTS
 # =========================================================
 
 def create_payment(
@@ -780,9 +941,11 @@ def create_payment(
     status: str = "pending"
 ) -> int:
 
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    now = (
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
 
     with db() as conn:
 
@@ -828,9 +991,11 @@ def update_payment(
     status: str,
     external_id: str | None = None
 ):
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    now = (
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
 
     with db() as conn:
 
@@ -924,29 +1089,14 @@ def activate_subscription(
     method: str,
     payment_id: str | None
 ):
-    """
-    Выдаёт подписку.
-
-    Старую активную подписку не удаляет.
-
-    Если подписка уже активна:
-        новая начинается после старой.
-
-    Если подписки нет:
-        новая начинается сейчас.
-
-    Если payment_id уже использовался:
-        повторно подписка не создаётся.
-    """
-
     if plan not in PLANS:
         raise ValueError(
             f"Unknown plan: {plan}"
         )
 
-    # -------------------------
+    # ---------------------------------------------
     # Защита от повторной оплаты
-    # -------------------------
+    # ---------------------------------------------
 
     if payment_id:
 
@@ -971,13 +1121,13 @@ def activate_subscription(
         timezone.utc
     )
 
+    # ---------------------------------------------
+    # Текущая подписка
+    # ---------------------------------------------
+
     current = get_active_subscription(
         user_id
     )
-
-    # -------------------------
-    # Определяем начало
-    # -------------------------
 
     if current:
 
@@ -999,9 +1149,30 @@ def activate_subscription(
 
         starts_at = now
 
-    # -------------------------
-    # Считаем окончание
-    # -------------------------
+    # ---------------------------------------------
+    # Бонусные дни рефералов
+    # ---------------------------------------------
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT referral_bonus_days
+            FROM profiles
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
+
+    referral_bonus_days = (
+        int(row["referral_bonus_days"])
+        if row
+        else 0
+    )
+
+    # ---------------------------------------------
+    # Срок
+    # ---------------------------------------------
 
     expires_at = (
         starts_at
@@ -1010,11 +1181,17 @@ def activate_subscription(
         )
     )
 
+    if referral_bonus_days > 0:
+
+        expires_at += timedelta(
+            days=referral_bonus_days
+        )
+
     now_iso = now.isoformat()
 
-    # -------------------------
-    # Запись
-    # -------------------------
+    # ---------------------------------------------
+    # INSERT
+    # ---------------------------------------------
 
     with db() as conn:
 
@@ -1075,6 +1252,18 @@ def activate_subscription(
             )
         )
 
+        # Бонусные дни использованы
+        if referral_bonus_days > 0:
+
+            conn.execute(
+                """
+                UPDATE profiles
+                SET referral_bonus_days=0
+                WHERE user_id=?
+                """,
+                (user_id,)
+            )
+
         conn.commit()
 
     logger.info(
@@ -1090,6 +1279,342 @@ def activate_subscription(
 
 
 # =========================================================
+# REFERRALS
+# =========================================================
+
+def add_referral(
+    referrer_id: int,
+    referred_id: int
+) -> bool:
+
+    if referrer_id == referred_id:
+        return False
+
+    ensure_profile(
+        referrer_id
+    )
+
+    ensure_profile(
+        referred_id
+    )
+
+    with db() as conn:
+
+        existing = conn.execute(
+            """
+            SELECT 1
+            FROM referrals
+            WHERE referred_id=?
+            LIMIT 1
+            """,
+            (referred_id,)
+        ).fetchone()
+
+        if existing:
+            return False
+
+        try:
+
+            conn.execute(
+                """
+                INSERT INTO referrals(
+                    referrer_id,
+                    referred_id,
+                    created_at,
+                    rewarded
+                )
+                VALUES(
+                    ?,
+                    ?,
+                    ?,
+                    0
+                )
+                """,
+                (
+                    referrer_id,
+                    referred_id,
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                )
+            )
+
+            conn.commit()
+
+            logger.info(
+                "REFERRAL ADDED: "
+                "referrer=%s referred=%s",
+                referrer_id,
+                referred_id
+            )
+
+            return True
+
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_referral_count(
+    user_id: int
+) -> int:
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM referrals
+            WHERE referrer_id=?
+            """,
+            (user_id,)
+        ).fetchone()
+
+    return int(
+        row[0]
+    )
+
+
+def get_referral_rewarded_count(
+    user_id: int
+) -> int:
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM referrals
+            WHERE referrer_id=?
+            AND rewarded=1
+            """,
+            (user_id,)
+        ).fetchone()
+
+    return int(
+        row[0]
+    )
+
+
+def get_referral_bonus_days(
+    user_id: int
+) -> int:
+
+    with db() as conn:
+
+        row = conn.execute(
+            """
+            SELECT referral_bonus_days
+            FROM profiles
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
+
+    if not row:
+        return 0
+
+    return int(
+        row["referral_bonus_days"] or 0
+    )
+
+
+async def get_referral_link(
+    bot,
+    user_id: int
+) -> str:
+
+    me = await bot.get_me()
+
+    return (
+        f"https://t.me/"
+        f"{me.username}"
+        f"?start=ref_{user_id}"
+    )
+
+
+async def reward_referrer_for_purchase(
+    bot,
+    referred_user_id: int
+):
+    """
+    Реферальный бонус начисляется только
+    после первой реальной оплаты приглашённого.
+
+    За каждую пару referrer -> referred
+    бонус выдаётся только один раз.
+    """
+
+    with db() as conn:
+
+        referral = conn.execute(
+            """
+            SELECT *
+            FROM referrals
+            WHERE referred_id=?
+            AND rewarded=0
+            LIMIT 1
+            """,
+            (referred_user_id,)
+        ).fetchone()
+
+    if not referral:
+        return False
+
+    referrer_id = (
+        referral["referrer_id"]
+    )
+
+    if referrer_id == referred_user_id:
+        return False
+
+    reward_days = max(
+        1,
+        REFERRAL_REWARD_DAYS
+    )
+
+    subscription = get_active_subscription(
+        referrer_id
+    )
+
+    # ---------------------------------------------
+    # У реферера уже есть подписка
+    # ---------------------------------------------
+
+    if subscription:
+
+        try:
+
+            expires_at = datetime.fromisoformat(
+                subscription["expires_at"]
+            )
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            new_expires_at = (
+                expires_at
+                + timedelta(
+                    days=reward_days
+                )
+            )
+
+            with db() as conn:
+
+                cur = conn.execute(
+                    """
+                    UPDATE referrals
+                    SET rewarded=1,
+                        rewarded_at=?
+                    WHERE id=?
+                    AND rewarded=0
+                    """,
+                    (
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        referral["id"]
+                    )
+                )
+
+                if cur.rowcount == 0:
+                    return False
+
+                conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET expires_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        new_expires_at.isoformat(),
+                        subscription["id"]
+                    )
+                )
+
+                conn.commit()
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            return False
+
+    # ---------------------------------------------
+    # У реферера подписки нет
+    # ---------------------------------------------
+
+    else:
+
+        with db() as conn:
+
+            cur = conn.execute(
+                """
+                UPDATE referrals
+                SET rewarded=1,
+                    rewarded_at=?
+                WHERE id=?
+                AND rewarded=0
+                """,
+                (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    referral["id"]
+                )
+            )
+
+            if cur.rowcount == 0:
+                return False
+
+            conn.execute(
+                """
+                UPDATE profiles
+                SET referral_bonus_days=
+                    referral_bonus_days+?
+                WHERE user_id=?
+                """,
+                (
+                    reward_days,
+                    referrer_id
+                )
+            )
+
+            conn.commit()
+
+    # ---------------------------------------------
+    # Сообщение рефереру
+    # ---------------------------------------------
+
+    try:
+
+        await bot.send_message(
+            referrer_id,
+            (
+                "🎁 Реферальный бонус!\n\n"
+                "Ваш реферал впервые оплатил "
+                "подписку.\n\n"
+                f"Вам начислено +{reward_days} "
+                "день подписки ✅"
+            )
+        )
+
+    except TelegramError:
+        pass
+
+    logger.info(
+        "REFERRAL REWARDED: "
+        "referrer=%s referred=%s days=%s",
+        referrer_id,
+        referred_user_id,
+        reward_days
+    )
+
+    return True
+
+
+# =========================================================
 # DAILY LIMIT
 # =========================================================
 
@@ -1097,9 +1622,13 @@ def request_usage(
     user_id: int
 ) -> tuple[bool, int]:
 
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
+    today = (
+        datetime.now(
+            timezone.utc
+        )
+        .date()
+        .isoformat()
+    )
 
     with db() as conn:
 
@@ -1170,9 +1699,13 @@ def usage_today(
     user_id: int
 ) -> int:
 
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
+    today = (
+        datetime.now(
+            timezone.utc
+        )
+        .date()
+        .isoformat()
+    )
 
     with db() as conn:
 
@@ -1353,9 +1886,11 @@ def redeem_promo(
         ):
             return "exhausted", None
 
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
+        now = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
 
         try:
 
@@ -1401,8 +1936,10 @@ def redeem_promo(
 # KEYBOARDS
 # =========================================================
 
-def kb_home():
-    return InlineKeyboardMarkup([
+def kb_home(
+    user_id: int | None = None
+):
+    rows = [
         [
             InlineKeyboardButton(
                 "👤 Личный кабинет",
@@ -1417,11 +1954,32 @@ def kb_home():
         ],
         [
             InlineKeyboardButton(
+                "👥 Реферальная система",
+                callback_data="nav:referrals"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "💬 Техподдержка",
                 callback_data="nav:support"
             )
         ],
-    ])
+    ]
+
+    if (
+        user_id is not None
+        and is_admin(user_id)
+    ):
+        rows.append([
+            InlineKeyboardButton(
+                "🛠 Админ-панель",
+                callback_data="admin:panel"
+            )
+        ])
+
+    return InlineKeyboardMarkup(
+        rows
+    )
 
 
 def kb_profile():
@@ -1636,6 +2194,52 @@ def kb_channel_gate():
     )
 
 
+def kb_referrals():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🏠 На главную",
+                callback_data="nav:home"
+            )
+        ]
+    ])
+
+
+def kb_admin():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📊 Статистика",
+                callback_data="admin:stats"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Пользователи",
+                callback_data="admin:users"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Покупки",
+                callback_data="admin:payments"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔗 Рефералы",
+                callback_data="admin:referrals"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 На главную",
+                callback_data="nav:home"
+            )
+        ],
+    ])
+
+
 # =========================================================
 # REQUIRED CHANNEL
 # =========================================================
@@ -1733,11 +2337,9 @@ async def channel_gate(
     context: ContextTypes.DEFAULT_TYPE
 ):
     """
-    Проверка обязательной подписки
-    на канал.
+    Отдельная обязательная подписка на канал.
 
-    Это отдельная проверка и она НЕ удаляет
-    купленную подписку из таблицы subscriptions.
+    Она НЕ влияет на таблицу subscriptions.
     """
 
     if not REQUIRED_CHANNEL_ID:
@@ -1748,11 +2350,15 @@ async def channel_gate(
     if not user or user.is_bot:
         return
 
+    # Админ не блокируется обязательной подпиской
+    if is_admin(user.id):
+        return
+
     q = update.callback_query
 
-    # -------------------------
+    # -----------------------------------------------------
     # Проверка кнопкой
-    # -------------------------
+    # -----------------------------------------------------
 
     if (
         q
@@ -1766,9 +2372,12 @@ async def channel_gate(
 
         if subscribed:
 
-            await q.answer(
-                "Подписка найдена ✅"
-            )
+            try:
+                await q.answer(
+                    "Подписка найдена ✅"
+                )
+            except TelegramError:
+                pass
 
             await show_home(
                 update,
@@ -1777,10 +2386,13 @@ async def channel_gate(
 
         else:
 
-            await q.answer(
-                "Вы ещё не подписались.",
-                show_alert=True
-            )
+            try:
+                await q.answer(
+                    "Вы ещё не подписались.",
+                    show_alert=True
+                )
+            except TelegramError:
+                pass
 
             await show_channel_gate(
                 update,
@@ -1789,23 +2401,42 @@ async def channel_gate(
 
         raise ApplicationHandlerStop
 
+    # -----------------------------------------------------
     # Не блокируем оплату Stars
+    # -----------------------------------------------------
+
     if update.pre_checkout_query:
         return
 
+    # -----------------------------------------------------
     # Не блокируем успешную оплату
+    # -----------------------------------------------------
+
     if (
         update.message
         and update.message.successful_payment
     ):
         return
 
-    # Уже подписан
+    # -----------------------------------------------------
+    # Проверка
+    # -----------------------------------------------------
+
     if await is_required_channel_member(
         context.bot,
         user.id
     ):
         return
+
+    if q:
+
+        try:
+            await q.answer(
+                "Сначала подпишитесь на канал.",
+                show_alert=True
+            )
+        except TelegramError:
+            pass
 
     await show_channel_gate(
         update,
@@ -1826,7 +2457,6 @@ async def safe_delete(
         return
 
     try:
-
         await message.delete()
 
     except TelegramError:
@@ -1864,19 +2494,35 @@ async def send_ui(
 
             with photo.open("rb") as fh:
 
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=fh,
-                    caption=text,
-                    reply_markup=markup
-                )
+                try:
+
+                    # Фото и текст в ОДНОМ сообщении.
+                    # Caption находится СВЕРХУ фото.
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=fh,
+                        caption=text,
+                        reply_markup=markup,
+                        show_caption_above_media=True
+                    )
+
+                except TypeError:
+
+                    # Совместимость со старой
+                    # версией python-telegram-bot.
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=fh,
+                        caption=text,
+                        reply_markup=markup
+                    )
 
                 return
 
         except Exception:
 
             logger.exception(
-                "Failed to send photo"
+                "Failed to send photo UI"
             )
 
     await context.bot.send_message(
@@ -1894,11 +2540,15 @@ async def show_home(
         "state"
     ] = None
 
+    user_id = (
+        update.effective_user.id
+    )
+
     await send_ui(
         update,
         context,
         GREETING,
-        kb_home()
+        kb_home(user_id)
     )
 
 
@@ -1993,7 +2643,8 @@ async def require_subscription(
         (
             "❌ Упс\n\n"
             "⭕️ У вас не имеется подписка\n\n"
-            "❗️ Оформите подписку в личном кабинете."
+            "❗️ Оформите подписку "
+            "в личном кабинете."
         ),
         kb_profile()
     )
@@ -2041,6 +2692,19 @@ def profile_caption(
         ):
             pass
 
+    bonus_days = get_referral_bonus_days(
+        user_id
+    )
+
+    bonus_text = ""
+
+    if bonus_days > 0:
+
+        bonus_text = (
+            f"\n🎁 Бонус рефералов — "
+            f"+{bonus_days} д."
+        )
+
     return (
         "👤 Личный кабинет\n\n"
         f"🤗 Уровень — "
@@ -2053,7 +2717,8 @@ def profile_caption(
         f"{profile['checks']}\n\n"
         f"💎 Подписка — "
         f"{sub_text}"
-        f"{expires_text}\n"
+        f"{expires_text}"
+        f"{bonus_text}\n"
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/50"
     )
@@ -2072,10 +2737,9 @@ async def run_hug_animation(
 ):
     """
     Первое сообщение уже отправлено
-    в confirm_and_send_hug().
+    confirm_and_send_hug().
 
-    Здесь оно повторно НЕ отправляется,
-    поэтому дубля больше нет.
+    Поэтому повторно его не отправляем.
     """
 
     count = 356
@@ -2109,7 +2773,6 @@ async def run_hug_animation(
                 text=f"💤{percent}%💤"
             )
 
-            # Ровно 1 секунда
             await asyncio.sleep(1)
 
         # -------------------------
@@ -2126,7 +2789,7 @@ async def run_hug_animation(
         )
 
         # -------------------------
-        # Запись результата
+        # Записываем результат
         # -------------------------
 
         add_hug(
@@ -2236,7 +2899,9 @@ async def confirm_and_send_hug(
         "🔰Ожидание до 1 минуты🔰"
     )
 
-    chat_id = update.effective_chat.id
+    chat_id = (
+        update.effective_chat.id
+    )
 
     q = update.callback_query
 
@@ -2266,7 +2931,9 @@ async def confirm_and_send_hug(
                 text=initial_text
             )
 
-            msg_id = msg.message_id
+            msg_id = (
+                msg.message_id
+            )
 
     # -------------------------
     # Обычное сообщение
@@ -2278,7 +2945,9 @@ async def confirm_and_send_hug(
             initial_text
         )
 
-        msg_id = msg.message_id
+        msg_id = (
+            msg.message_id
+        )
 
     # -------------------------
     # Запасной вариант
@@ -2291,7 +2960,9 @@ async def confirm_and_send_hug(
             text=initial_text
         )
 
-        msg_id = msg.message_id
+        msg_id = (
+            msg.message_id
+        )
 
     # -------------------------
     # Запуск анимации
@@ -2371,10 +3042,12 @@ async def do_check(
     )
 
     await update.message.reply_text(
-        f"🔎 Результат проверки {target}\n\n"
-        f"🤗 Обнимашковость — "
-        f"{random.randint(60, 100)}%\n\n"
-        "✅ Проверка завершена.",
+        (
+            f"🔎 Результат проверки {target}\n\n"
+            f"🤗 Обнимашковость — "
+            f"{random.randint(60, 100)}%\n\n"
+            "✅ Проверка завершена."
+        ),
         reply_markup=kb_menu()
     )
 
@@ -2458,6 +3131,56 @@ async def show_history(
 
 
 # =========================================================
+# REFERRAL PAGE
+# =========================================================
+
+async def show_referrals(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = (
+        update.effective_user.id
+    )
+
+    link = await get_referral_link(
+        context.bot,
+        user_id
+    )
+
+    total = get_referral_count(
+        user_id
+    )
+
+    rewarded = get_referral_rewarded_count(
+        user_id
+    )
+
+    bonus_days = get_referral_bonus_days(
+        user_id
+    )
+
+    text = (
+        "👥 Реферальная система\n\n"
+        f"👤 Приглашено — {total}\n"
+        f"💳 Оплатили — {rewarded}\n"
+        f"🎁 Бонусных дней — {bonus_days}\n\n"
+        "🔗 Ваша ссылка:\n"
+        f"{link}\n\n"
+        f"🎁 За каждого приглашённого, "
+        f"который впервые оплатит подписку, "
+        f"вы получаете +{REFERRAL_REWARD_DAYS} "
+        "день подписки."
+    )
+
+    await send_ui(
+        update,
+        context,
+        text,
+        kb_referrals()
+    )
+
+
+# =========================================================
 # NAV CALLBACK
 # =========================================================
 
@@ -2468,7 +3191,6 @@ async def nav_callback(
     q = update.callback_query
 
     user_id = q.from_user.id
-
     data = q.data
 
     ensure_profile(
@@ -2476,16 +3198,11 @@ async def nav_callback(
     )
 
     try:
-
         await q.answer()
-
     except TelegramError:
         pass
 
-    # -------------------------
     # HOME
-    # -------------------------
-
     if data == "nav:home":
 
         await show_home(
@@ -2495,10 +3212,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # PROFILE
-    # -------------------------
-
     if data == "nav:profile":
 
         await show_profile(
@@ -2508,10 +3222,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # MENU
-    # -------------------------
-
     if data == "nav:menu":
 
         await show_menu(
@@ -2521,10 +3232,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # SUPPORT
-    # -------------------------
-
     if data == "nav:support":
 
         await show_support(
@@ -2534,10 +3242,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # SUBSCRIPTION
-    # -------------------------
-
     if data == "nav:sub":
 
         await show_subscription(
@@ -2547,10 +3252,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # PROMO
-    # -------------------------
-
     if data == "nav:promo":
 
         context.user_data[
@@ -2566,10 +3268,17 @@ async def nav_callback(
 
         return
 
-    # -------------------------
-    # HUG
-    # -------------------------
+    # REFERRALS
+    if data == "nav:referrals":
 
+        await show_referrals(
+            update,
+            context
+        )
+
+        return
+
+    # HUG
     if data == "menu:hug":
 
         await start_hug(
@@ -2580,10 +3289,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # SEARCH
-    # -------------------------
-
     if data == "menu:search":
 
         await do_search(
@@ -2594,10 +3300,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # CHECK
-    # -------------------------
-
     if data == "menu:check":
 
         await start_check(
@@ -2608,10 +3311,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
     # HISTORY
-    # -------------------------
-
     if data == "menu:history":
 
         await show_history(
@@ -2622,10 +3322,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
-    # YES
-    # -------------------------
-
+    # HUG YES
     if data == "hug:yes":
 
         if not context.user_data.get(
@@ -2652,10 +3349,7 @@ async def nav_callback(
 
         return
 
-    # -------------------------
-    # NO
-    # -------------------------
-
+    # HUG NO
     if data == "hug:no":
 
         context.user_data[
@@ -2676,726 +3370,542 @@ async def nav_callback(
 
 
 # =========================================================
-# SUB CALLBACK
+# ADMIN STATS
 # =========================================================
 
-async def subscription_callback(
+def admin_stats() -> str:
+
+    today = (
+        datetime.now(
+            timezone.utc
+        )
+        .date()
+        .isoformat()
+    )
+
+    with db() as conn:
+
+        # Всего пользователей
+        total_users = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM profiles
+            """
+        ).fetchone()[0]
+
+        # Новые сегодня
+        new_today = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM profiles
+            WHERE substr(
+                first_seen_at,
+                1,
+                10
+            )=?
+            """,
+            (today,)
+        ).fetchone()[0]
+
+        # Всего успешных оплат
+        total_paid = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM payments
+            WHERE status='paid'
+            """
+        ).fetchone()[0]
+
+        # Уникальные покупатели
+        unique_buyers = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id)
+            FROM payments
+            WHERE status='paid'
+            """
+        ).fetchone()[0]
+
+        # Stars
+        stars_payments = conn.execute(
+            """
+            SELECT plan
+            FROM payments
+            WHERE status='paid'
+            AND method='stars'
+            """
+        ).fetchall()
+
+        # Crypto
+        crypto_payments = conn.execute(
+            """
+            SELECT plan
+            FROM payments
+            WHERE status='paid'
+            AND method='cryptobot'
+            """
+        ).fetchall()
+
+        # Рефералы
+        total_referrals = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM referrals
+            """
+        ).fetchone()[0]
+
+        converted_referrals = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM referrals
+            WHERE rewarded=1
+            """
+        ).fetchone()[0]
+
+        # Запросы сегодня
+        requests_today = conn.execute(
+            """
+            SELECT COALESCE(
+                SUM(requests),
+                0
+            )
+            FROM daily_usage
+            WHERE usage_date=?
+            """,
+            (today,)
+        ).fetchone()[0]
+
+        # Всего запусков sn1c
+        total_hugs = conn.execute(
+            """
+            SELECT COALESCE(
+                SUM(count),
+                0
+            )
+            FROM hugs
+            """
+        ).fetchone()[0]
+
+        # Проверки
+        total_checks = conn.execute(
+            """
+            SELECT COALESCE(
+                SUM(checks),
+                0
+            )
+            FROM profiles
+            """
+        ).fetchone()[0]
+
+        # Все подписки
+        subscription_rows = conn.execute(
+            """
+            SELECT user_id, expires_at
+            FROM subscriptions
+            """
+        ).fetchall()
+
+    # -------------------------
+    # Активные подписчики
+    # -------------------------
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    active_users = set()
+
+    for row in subscription_rows:
+
+        try:
+
+            expires_at = datetime.fromisoformat(
+                row["expires_at"]
+            )
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if expires_at > now:
+
+                active_users.add(
+                    row["user_id"]
+                )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            continue
+
+    active_subscriptions = len(
+        active_users
+    )
+
+    # -------------------------
+    # Stars revenue
+    # -------------------------
+
+    total_stars = 0
+
+    for row in stars_payments:
+
+        plan = row["plan"]
+
+        if plan in PLANS:
+            total_stars += int(
+                PLANS[plan]["stars"]
+            )
+
+    # -------------------------
+    # Crypto revenue
+    # -------------------------
+
+    total_crypto_usd = 0.0
+
+    for row in crypto_payments:
+
+        plan = row["plan"]
+
+        if plan not in PLANS:
+            continue
+
+        try:
+
+            total_crypto_usd += float(
+                PLANS[plan]["usd"] or 0
+            )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    return (
+        "🛠 АДМИН-ПАНЕЛЬ\n\n"
+
+        "👥 Пользователи\n"
+        f"• Всего — {total_users}\n"
+        f"• Сегодня — {new_today}\n\n"
+
+        "💎 Подписки\n"
+        f"• Активных — {active_subscriptions}\n"
+        f"• Всего оплат — {total_paid}\n"
+        f"• Уникальных покупателей — "
+        f"{unique_buyers}\n\n"
+
+        "💰 ОПЛАТЫ\n"
+        f"• Telegram Stars — "
+        f"{total_stars}⭐\n"
+        f"• CryptoBot — "
+        f"{total_crypto_usd:.2f}$\n\n"
+
+        "🔗 Рефералы\n"
+        f"• Всего — {total_referrals}\n"
+        f"• Конвертировано — "
+        f"{converted_referrals}\n\n"
+
+        "📊 Активность\n"
+        f"• Запросов сегодня — "
+        f"{requests_today}\n"
+        f"• Всего sn1cов — "
+        f"{total_hugs}\n"
+        f"• Всего проверок — "
+        f"{total_checks}"
+    )
+
+
+async def show_admin_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = (
+        update.effective_user.id
+    )
+
+    if not is_admin(
+        user_id
+    ):
+
+        await send_ui(
+            update,
+            context,
+            "❌ Доступ запрещён.",
+            kb_home(user_id)
+        )
+
+        return
+
+    await send_ui(
+        update,
+        context,
+        admin_stats(),
+        kb_admin()
+    )
+
+
+# =========================================================
+# ADMIN USERS
+# =========================================================
+
+async def show_admin_users(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    with db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                user_id,
+                first_seen_at
+            FROM profiles
+            ORDER BY first_seen_at DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+    if not rows:
+
+        text = (
+            "👥 Пользователей пока нет."
+        )
+
+    else:
+
+        lines = [
+            "👥 ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ\n"
+        ]
+
+        for row in rows:
+
+            lines.append(
+                f"• {row['user_id']}\n"
+                f"  {row['first_seen_at']}"
+            )
+
+        text = "\n".join(
+            lines
+        )
+
+    await send_ui(
+        update,
+        context,
+        text,
+        kb_admin()
+    )
+
+
+# =========================================================
+# ADMIN PAYMENTS
+# =========================================================
+
+async def show_admin_payments(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    with db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                user_id,
+                plan,
+                method,
+                status,
+                created_at
+            FROM payments
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+    if not rows:
+
+        text = (
+            "💳 Покупок пока нет."
+        )
+
+    else:
+
+        lines = [
+            "💳 ПОСЛЕДНИЕ ПОКУПКИ\n"
+        ]
+
+        for row in rows:
+
+            if row["status"] == "paid":
+                status = "✅"
+            elif row["status"] == "pending":
+                status = "⏳"
+            else:
+                status = "❌"
+
+            lines.append(
+                f"{status} "
+                f"{row['user_id']} | "
+                f"{row['plan']} | "
+                f"{row['method']}\n"
+                f"   {row['created_at']}"
+            )
+
+        text = "\n".join(
+            lines
+        )
+
+    await send_ui(
+        update,
+        context,
+        text,
+        kb_admin()
+    )
+
+
+# =========================================================
+# ADMIN REFERRALS
+# =========================================================
+
+async def show_admin_referrals(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    with db() as conn:
+
+        rows = conn.execute(
+            """
+            SELECT
+                referrer_id,
+                referred_id,
+                created_at,
+                rewarded
+            FROM referrals
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+    if not rows:
+
+        text = (
+            "🔗 Рефералов пока нет."
+        )
+
+    else:
+
+        lines = [
+            "🔗 ПОСЛЕДНИЕ РЕФЕРАЛЫ\n"
+        ]
+
+        for row in rows:
+
+            reward = (
+                "✅"
+                if row["rewarded"]
+                else "⏳"
+            )
+
+            lines.append(
+                f"{reward} "
+                f"{row['referrer_id']} → "
+                f"{row['referred_id']}\n"
+                f"   {row['created_at']}"
+            )
+
+        text = "\n".join(
+            lines
+        )
+
+    await send_ui(
+        update,
+        context,
+        text,
+        kb_admin()
+    )
+
+
+# =========================================================
+# ADMIN CALLBACK
+# =========================================================
+
+async def admin_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
     q = update.callback_query
+
+    user_id = (
+        q.from_user.id
+    )
+
+    if not is_admin(
+        user_id
+    ):
+
+        try:
+            await q.answer(
+                "Доступ запрещён.",
+                show_alert=True
+            )
+        except TelegramError:
+            pass
+
+        return
 
     try:
         await q.answer()
     except TelegramError:
         pass
 
-    user_id = q.from_user.id
-
     data = q.data
 
-    ensure_profile(
-        user_id
-    )
+    if data == "admin:panel":
 
-    # =====================================================
-    # PLAN
-    # =====================================================
-
-    if (
-        data.startswith("sub:")
-        and data.count(":") == 1
-    ):
-
-        plan = data.split(":")[1]
-
-        if plan not in PLANS:
-            return
-
-        p = PLANS[plan]
-
-        if p["usd"]:
-
-            price_text = (
-                f"{p['usd']}$ / "
-                f"{p['stars']}⭐"
-            )
-
-        else:
-
-            price_text = (
-                f"{p['stars']}⭐"
-            )
-
-        text = (
-            f"💎 {p['title']}\n\n"
-            f"⏳ Срок — {p['days']} дней\n"
-            f"💵 Цена — {price_text}\n\n"
-            "После оплаты подписка выдаётся "
-            "автоматически.\n\n"
-            "Выберите способ оплаты:"
-        )
-
-        await send_ui(
-            update,
-            context,
-            text,
-            kb_pay_methods(plan)
-        )
-
-        return
-
-    # =====================================================
-    # BACK
-    # =====================================================
-
-    if data == "pay:back":
-
-        await show_subscription(
+        await show_admin_panel(
             update,
             context
         )
 
         return
 
-    # =====================================================
-    # CRYPTOBOT
-    # =====================================================
-
-    if data.startswith(
-        "pay:crypto:"
-    ):
-
-        plan = data.split(":")[-1]
-
-        if plan not in PLANS:
-            return
-
-        crypto_price = PLANS[plan]["usd"]
-
-        # -------------------------
-        # Год без USD цены
-        # -------------------------
-
-        if (
-            not crypto_price
-            and not (
-                CRYPTO_FALLBACK_YEAR
-                if plan == "year"
-                else False
-            )
-        ):
-
-            fallback = None
-
-            if plan == "week":
-                fallback = (
-                    CRYPTO_FALLBACK_WEEK
-                )
-
-            elif plan == "month":
-                fallback = (
-                    CRYPTO_FALLBACK_MONTH
-                )
-
-            elif plan == "year":
-                fallback = (
-                    CRYPTO_FALLBACK_YEAR
-                )
-
-            if not fallback:
-
-                await send_ui(
-                    update,
-                    context,
-                    (
-                        "⚠️ Для этого тарифа "
-                        "CryptoBot пока не настроен.\n\n"
-                        "Используйте Telegram Stars."
-                    ),
-                    kb_pay_methods(plan)
-                )
-
-                return
-
-        # -------------------------
-        # Token не указан
-        # -------------------------
-
-        if not CRYPTO_PAY_API_TOKEN:
-
-            fallback = None
-
-            if plan == "week":
-                fallback = (
-                    CRYPTO_FALLBACK_WEEK
-                )
-
-            elif plan == "month":
-                fallback = (
-                    CRYPTO_FALLBACK_MONTH
-                )
-
-            elif plan == "year":
-                fallback = (
-                    CRYPTO_FALLBACK_YEAR
-                )
-
-            if fallback:
-
-                markup = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "💳 Оплатить в CryptoBot",
-                            url=fallback
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Я оплатил",
-                            callback_data=(
-                                f"manual_crypto:{plan}"
-                            )
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "❌ Отменить",
-                            callback_data="pay:cancel"
-                        )
-                    ],
-                ])
-
-                await send_ui(
-                    update,
-                    context,
-                    (
-                        "💳 Оплата через CryptoBot\n\n"
-                        "После оплаты нажмите "
-                        "«Я оплатил».\n\n"
-                        "⚠️ Автоматическая проверка "
-                        "не работает без "
-                        "CRYPTO_PAY_API_TOKEN."
-                    ),
-                    markup
-                )
-
-                return
-
-            await send_ui(
-                update,
-                context,
-                (
-                    "❌ CryptoBot не настроен.\n\n"
-                    "Добавьте "
-                    "CRYPTO_PAY_API_TOKEN "
-                    "в Environment Variables."
-                ),
-                kb_pay_methods(plan)
-            )
-
-            return
-
-        try:
-
-            invoice, _payload = (
-                await create_crypto_invoice(
-                    user_id,
-                    plan
-                )
-            )
-
-            invoice_id = int(
-                invoice["invoice_id"]
-            )
-
-            payment_db_id = create_payment(
-                user_id,
-                plan,
-                "cryptobot",
-                str(invoice_id)
-            )
-
-            url = (
-                invoice.get(
-                    "bot_invoice_url"
-                )
-                or invoice.get(
-                    "mini_app_invoice_url"
-                )
-                or invoice.get(
-                    "web_app_invoice_url"
-                )
-            )
-
-            if not url:
-                raise RuntimeError(
-                    "CryptoBot did not return "
-                    "invoice URL"
-                )
-
-            markup = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "💳 Оплатить",
-                        url=url
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✅ Я оплатил",
-                        callback_data=(
-                            f"check_crypto:"
-                            f"{invoice_id}:"
-                            f"{plan}:"
-                            f"{payment_db_id}"
-                        )
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Отменить",
-                        callback_data="pay:cancel"
-                    )
-                ],
-            ])
-
-            await send_ui(
-                update,
-                context,
-                (
-                    "💳 Оплата подписки\n\n"
-                    f"{PLANS[plan]['title']}\n\n"
-                    "После успешной оплаты "
-                    "бот автоматически "
-                    "выдаст подписку."
-                ),
-                markup
-            )
-
-            context.application.create_task(
-                crypto_watch(
-                    context.application,
-                    user_id,
-                    plan,
-                    payment_db_id,
-                    invoice_id
-                )
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Crypto invoice creation failed"
-            )
-
-            await send_ui(
-                update,
-                context,
-                (
-                    "❌ Не удалось создать счёт.\n\n"
-                    "Попробуйте Telegram Stars."
-                ),
-                kb_pay_methods(plan)
-            )
-
-        return
-
-    # =====================================================
-    # TELEGRAM STARS
-    # =====================================================
-
-    if data.startswith(
-        "pay:stars:"
-    ):
-
-        plan = data.split(":")[-1]
-
-        if plan not in PLANS:
-            return
-
-        p = PLANS[plan]
-
-        payment_db_id = create_payment(
-            user_id,
-            plan,
-            "stars",
-            None
-        )
-
-        context.user_data[
-            "pending_star_payment"
-        ] = payment_db_id
-
-        await safe_delete(
-            q.message
-        )
-
-        try:
-
-            await context.bot.send_invoice(
-                chat_id=user_id,
-                title=p["title"],
-                description=(
-                    "Доступ к функциям бота "
-                    f"на {p['days']} дней."
-                ),
-                payload=(
-                    f"hug:"
-                    f"{user_id}:"
-                    f"{plan}:"
-                    f"{payment_db_id}"
-                ),
-                provider_token="",
-                currency="XTR",
-                prices=[
-                    LabeledPrice(
-                        p["title"],
-                        p["stars"]
-                    )
-                ],
-            )
-
-            await context.bot.send_message(
-                user_id,
-                (
-                    "⭐️ Оплатите счёт выше.\n\n"
-                    "После успешной оплаты "
-                    "подписка активируется "
-                    "автоматически."
-                ),
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "❌ Отменить",
-                            callback_data="pay:cancel"
-                        )
-                    ]
-                ])
-            )
-
-        except TelegramError:
-
-            logger.exception(
-                "Stars invoice failed"
-            )
-
-            update_payment(
-                payment_db_id,
-                "failed"
-            )
-
-            await context.bot.send_message(
-                user_id,
-                (
-                    "❌ Не удалось создать счёт Stars.\n\n"
-                    "Попробуйте CryptoBot."
-                ),
-                reply_markup=kb_pay_methods(plan)
-            )
-
-        return
-
-    # =====================================================
-    # CANCEL
-    # =====================================================
-
-    if data == "pay:cancel":
+    if data == "admin:stats":
 
         await send_ui(
             update,
             context,
-            "❌ Оплата отменена.",
-            kb_home()
+            admin_stats(),
+            kb_admin()
         )
 
         return
 
-    # =====================================================
-    # CRYPTO CHECK
-    # =====================================================
+    if data == "admin:users":
 
-    if data.startswith(
-        "check_crypto:"
-    ):
-
-        parts = data.split(":")
-
-        if len(parts) < 4:
-            return
-
-        try:
-
-            invoice_id = parts[1]
-            plan = parts[2]
-            payment_db_id = int(
-                parts[3]
-            )
-
-        except (
-            ValueError,
-            IndexError
-        ):
-
-            await q.answer(
-                "Некорректные данные оплаты.",
-                show_alert=True
-            )
-
-            return
-
-        if plan not in PLANS:
-            return
-
-        existing = find_subscription_by_payment(
-            str(invoice_id)
+        await show_admin_users(
+            update,
+            context
         )
-
-        if existing:
-
-            await send_ui(
-                update,
-                context,
-                "✅ Оплата уже зачислена.",
-                kb_after_pay(None)
-            )
-
-            return
-
-        if not CRYPTO_PAY_API_TOKEN:
-
-            await q.answer(
-                "Автопроверка не настроена.",
-                show_alert=True
-            )
-
-            return
-
-        try:
-
-            result = await crypto_api(
-                "getInvoices",
-                {
-                    "invoice_ids":
-                        str(invoice_id)
-                }
-            )
-
-            items = result.get(
-                "items",
-                []
-            )
-
-            if (
-                items
-                and items[0].get("status")
-                == "paid"
-            ):
-
-                await grant_paid_access(
-                    context.bot,
-                    user_id,
-                    plan,
-                    "cryptobot",
-                    str(invoice_id),
-                    payment_db_id
-                )
-
-                await safe_delete(
-                    q.message
-                )
-
-                return
-
-            await q.answer(
-                (
-                    "Оплата ещё не найдена.\n"
-                    "Подождите немного и "
-                    "попробуйте снова."
-                ),
-                show_alert=True
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Crypto manual check failed"
-            )
-
-            await q.answer(
-                "Не удалось проверить оплату.",
-                show_alert=True
-            )
 
         return
 
+    if data == "admin:payments":
 
-# =========================================================
-# CRYPTO API
-# =========================================================
-
-async def crypto_api(
-    method: str,
-    payload: dict
-):
-    if not CRYPTO_PAY_API_TOKEN:
-        raise RuntimeError(
-            "CRYPTO_PAY_API_TOKEN is not configured"
+        await show_admin_payments(
+            update,
+            context
         )
 
-    headers = {
-        "Crypto-Pay-API-Token":
-            CRYPTO_PAY_API_TOKEN
-    }
+        return
 
-    async with httpx.AsyncClient(
-        timeout=20
-    ) as client:
+    if data == "admin:referrals":
 
-        response = await client.post(
-            (
-                "https://pay.crypt.bot/"
-                f"api/{method}"
-            ),
-            json=payload,
-            headers=headers
+        await show_admin_referrals(
+            update,
+            context
         )
 
-        response.raise_for_status()
-
-        data = response.json()
-
-    if not data.get("ok"):
-
-        raise RuntimeError(
-            data.get(
-                "error",
-                {}
-            ).get(
-                "name",
-                "Crypto Pay API error"
-            )
-        )
-
-    return data["result"]
-
-
-async def create_crypto_invoice(
-    user_id: int,
-    plan: str
-):
-    if plan not in PLANS:
-        raise ValueError(
-            f"Unknown plan: {plan}"
-        )
-
-    amount = PLANS[plan]["usd"]
-
-    if not amount:
-        raise RuntimeError(
-            f"USD price is not configured "
-            f"for plan={plan}"
-        )
-
-    payload_id = (
-        f"hug:"
-        f"{user_id}:"
-        f"{plan}:"
-        f"{int(datetime.now(timezone.utc).timestamp())}"
-    )
-
-    result = await crypto_api(
-        "createInvoice",
-        {
-            "asset": CRYPTO_ASSET,
-            "amount": amount,
-            "description": (
-                PLANS[plan]["title"]
-            ),
-            "payload": payload_id,
-            "allow_comments": False,
-            "allow_anonymous": False,
-            "expires_in": 1800,
-        }
-    )
-
-    return result, payload_id
-
-
-async def crypto_watch(
-    application: Application,
-    user_id: int,
-    plan: str,
-    payment_db_id: int,
-    invoice_id: int
-):
-    for _ in range(180):
-
-        try:
-
-            if find_subscription_by_payment(
-                str(invoice_id)
-            ):
-                return
-
-            result = await crypto_api(
-                "getInvoices",
-                {
-                    "invoice_ids":
-                        str(invoice_id)
-                }
-            )
-
-            items = result.get(
-                "items",
-                []
-            )
-
-            if (
-                items
-                and items[0].get("status")
-                == "paid"
-            ):
-
-                await grant_paid_access(
-                    application.bot,
-                    user_id,
-                    plan,
-                    "cryptobot",
-                    str(invoice_id),
-                    payment_db_id
-                )
-
-                return
-
-            if (
-                items
-                and items[0].get("status")
-                in {
-                    "expired",
-                    "invalid"
-                }
-            ):
-
-                update_payment(
-                    payment_db_id,
-                    items[0].get("status")
-                )
-
-                return
-
-        except Exception:
-
-            logger.exception(
-                "Crypto watcher error"
-            )
-
-        await asyncio.sleep(10)
-
-    update_payment(
-        payment_db_id,
-        "timeout"
-    )
+        return
 
 
 # =========================================================
@@ -3434,7 +3944,7 @@ async def issue_channel_invite(
     )
 
     # -------------------------
-    # Проверяем участника
+    # Проверка участника
     # -------------------------
 
     try:
@@ -3459,7 +3969,8 @@ async def issue_channel_invite(
 
         logger.warning(
             "Could not check channel member: "
-            "plan=%s channel=%s user=%s error=%s",
+            "plan=%s channel=%s user=%s "
+            "error=%s",
             plan,
             channel,
             user_id,
@@ -3467,7 +3978,7 @@ async def issue_channel_invite(
         )
 
     # -------------------------
-    # Срок ссылки
+    # Дата окончания ссылки
     # -------------------------
 
     subscription = get_active_subscription(
@@ -3506,7 +4017,8 @@ async def issue_channel_invite(
         invite = await bot.create_chat_invite_link(
             chat_id=channel,
             name=(
-                f"user {user_id} {plan}"
+                f"user {user_id} "
+                f"{plan}"
             ),
             member_limit=1,
             expire_date=expire_date
@@ -3598,7 +4110,7 @@ def access_granted_text(
     return text
 
 
-# Оплаты, которые уже были уведомлены
+# Защита от повторной отправки
 _notified_payments: set[str] = set()
 
 
@@ -3611,7 +4123,7 @@ async def grant_paid_access(
     payment_db_id: int | None = None
 ):
     # -------------------------
-    # Уже существует
+    # Если уже есть такая подписка
     # -------------------------
 
     existing = find_subscription_by_payment(
@@ -3637,11 +4149,10 @@ async def grant_paid_access(
             ValueError,
             TypeError
         ):
-
             return None
 
     # -------------------------
-    # Не даём повторную выдачу
+    # Защита от дубля события
     # -------------------------
 
     if payment_key in _notified_payments:
@@ -3670,7 +4181,7 @@ async def grant_paid_access(
         )
 
     # -------------------------
-    # Активируем
+    # Создаём подписку
     # -------------------------
 
     expires = activate_subscription(
@@ -3681,7 +4192,16 @@ async def grant_paid_access(
     )
 
     # -------------------------
-    # Ссылка в канал
+    # Реферальный бонус
+    # -------------------------
+
+    await reward_referrer_for_purchase(
+        bot,
+        user_id
+    )
+
+    # -------------------------
+    # Канал
     # -------------------------
 
     link, invite_status = (
@@ -3851,7 +4371,724 @@ async def apply_promo_text(
 
 
 # =========================================================
-# STARS
+# CRYPTO API
+# =========================================================
+
+async def crypto_api(
+    method: str,
+    payload: dict
+):
+    if not CRYPTO_PAY_API_TOKEN:
+        raise RuntimeError(
+            "CRYPTO_PAY_API_TOKEN "
+            "is not configured"
+        )
+
+    headers = {
+        "Crypto-Pay-API-Token":
+            CRYPTO_PAY_API_TOKEN
+    }
+
+    async with httpx.AsyncClient(
+        timeout=20
+    ) as client:
+
+        response = await client.post(
+            (
+                "https://pay.crypt.bot/"
+                f"api/{method}"
+            ),
+            json=payload,
+            headers=headers
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+    if not data.get("ok"):
+
+        raise RuntimeError(
+            data.get(
+                "error",
+                {}
+            ).get(
+                "name",
+                "Crypto Pay API error"
+            )
+        )
+
+    return data["result"]
+
+
+async def create_crypto_invoice(
+    user_id: int,
+    plan: str
+):
+    if plan not in PLANS:
+        raise ValueError(
+            f"Unknown plan: {plan}"
+        )
+
+    amount = PLANS[plan]["usd"]
+
+    if not amount:
+        raise RuntimeError(
+            "USD price is not configured "
+            f"for plan={plan}"
+        )
+
+    payload_id = (
+        f"hug:"
+        f"{user_id}:"
+        f"{plan}:"
+        f"{int(datetime.now(timezone.utc).timestamp())}"
+    )
+
+    result = await crypto_api(
+        "createInvoice",
+        {
+            "asset": CRYPTO_ASSET,
+            "amount": amount,
+            "description": (
+                PLANS[plan]["title"]
+            ),
+            "payload": payload_id,
+            "allow_comments": False,
+            "allow_anonymous": False,
+            "expires_in": 1800,
+        }
+    )
+
+    return result, payload_id
+
+
+async def crypto_watch(
+    application: Application,
+    user_id: int,
+    plan: str,
+    payment_db_id: int,
+    invoice_id: int
+):
+    for _ in range(180):
+
+        try:
+
+            if find_subscription_by_payment(
+                str(invoice_id)
+            ):
+                return
+
+            result = await crypto_api(
+                "getInvoices",
+                {
+                    "invoice_ids":
+                        str(invoice_id)
+                }
+            )
+
+            items = result.get(
+                "items",
+                []
+            )
+
+            if (
+                items
+                and items[0].get("status")
+                == "paid"
+            ):
+
+                await grant_paid_access(
+                    application.bot,
+                    user_id,
+                    plan,
+                    "cryptobot",
+                    str(invoice_id),
+                    payment_db_id
+                )
+
+                return
+
+            if (
+                items
+                and items[0].get("status")
+                in {
+                    "expired",
+                    "invalid"
+                }
+            ):
+
+                update_payment(
+                    payment_db_id,
+                    items[0].get(
+                        "status"
+                    )
+                )
+
+                return
+
+        except Exception:
+
+            logger.exception(
+                "Crypto watcher error"
+            )
+
+        await asyncio.sleep(
+            10
+        )
+
+    update_payment(
+        payment_db_id,
+        "timeout"
+    )
+
+
+# =========================================================
+# SUBSCRIPTION CALLBACK
+# =========================================================
+
+async def subscription_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    q = update.callback_query
+
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+
+    user_id = q.from_user.id
+
+    data = q.data
+
+    ensure_profile(
+        user_id
+    )
+
+    # =====================================================
+    # PLAN
+    # =====================================================
+
+    if (
+        data.startswith("sub:")
+        and data.count(":") == 1
+    ):
+
+        plan = data.split(":")[1]
+
+        if plan not in PLANS:
+            return
+
+        p = PLANS[plan]
+
+        if p["usd"]:
+
+            price_text = (
+                f"{p['usd']}$ / "
+                f"{p['stars']}⭐"
+            )
+
+        else:
+
+            price_text = (
+                f"{p['stars']}⭐"
+            )
+
+        text = (
+            f"💎 {p['title']}\n\n"
+            f"⏳ Срок — {p['days']} дней\n"
+            f"💵 Цена — {price_text}\n\n"
+            "После оплаты подписка выдаётся "
+            "автоматически.\n\n"
+            "Выберите способ оплаты:"
+        )
+
+        await send_ui(
+            update,
+            context,
+            text,
+            kb_pay_methods(plan)
+        )
+
+        return
+
+    # =====================================================
+    # BACK
+    # =====================================================
+
+    if data == "pay:back":
+
+        await show_subscription(
+            update,
+            context
+        )
+
+        return
+
+    # =====================================================
+    # CRYPTOBOT
+    # =====================================================
+
+    if data.startswith(
+        "pay:crypto:"
+    ):
+
+        plan = data.split(":")[-1]
+
+        if plan not in PLANS:
+            return
+
+        # -------------------------
+        # Fallback links
+        # -------------------------
+
+        fallback = None
+
+        if plan == "week":
+            fallback = CRYPTO_FALLBACK_WEEK
+
+        elif plan == "month":
+            fallback = CRYPTO_FALLBACK_MONTH
+
+        elif plan == "year":
+            fallback = CRYPTO_FALLBACK_YEAR
+
+        # -------------------------
+        # API token отсутствует
+        # -------------------------
+
+        if not CRYPTO_PAY_API_TOKEN:
+
+            if fallback:
+
+                markup = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "💳 Оплатить в CryptoBot",
+                            url=fallback
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Я оплатил",
+                            callback_data=(
+                                f"manual_crypto:"
+                                f"{plan}"
+                            )
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ Отменить",
+                            callback_data="pay:cancel"
+                        )
+                    ],
+                ])
+
+                await send_ui(
+                    update,
+                    context,
+                    (
+                        "💳 Оплата через CryptoBot\n\n"
+                        f"{PLANS[plan]['title']}\n\n"
+                        "После оплаты нажмите "
+                        "«Я оплатил»."
+                    ),
+                    markup
+                )
+
+                return
+
+            await send_ui(
+                update,
+                context,
+                (
+                    "❌ CryptoBot не настроен.\n\n"
+                    "Добавьте "
+                    "CRYPTO_PAY_API_TOKEN "
+                    "в Render."
+                ),
+                kb_pay_methods(plan)
+            )
+
+            return
+
+        # -------------------------
+        # API
+        # -------------------------
+
+        try:
+
+            invoice, _payload = (
+                await create_crypto_invoice(
+                    user_id,
+                    plan
+                )
+            )
+
+            invoice_id = int(
+                invoice["invoice_id"]
+            )
+
+            payment_db_id = create_payment(
+                user_id,
+                plan,
+                "cryptobot",
+                str(invoice_id)
+            )
+
+            url = (
+                invoice.get(
+                    "bot_invoice_url"
+                )
+                or invoice.get(
+                    "mini_app_invoice_url"
+                )
+                or invoice.get(
+                    "web_app_invoice_url"
+                )
+            )
+
+            if not url:
+                raise RuntimeError(
+                    "CryptoBot did not return "
+                    "invoice URL"
+                )
+
+            markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💳 Оплатить",
+                        url=url
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ Я оплатил",
+                        callback_data=(
+                            f"check_crypto:"
+                            f"{invoice_id}:"
+                            f"{plan}:"
+                            f"{payment_db_id}"
+                        )
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Отменить",
+                        callback_data="pay:cancel"
+                    )
+                ],
+            ])
+
+            await send_ui(
+                update,
+                context,
+                (
+                    "💳 Оплата подписки\n\n"
+                    f"{PLANS[plan]['title']}\n\n"
+                    "Нажмите «Оплатить».\n"
+                    "После оплаты подписка "
+                    "активируется автоматически."
+                ),
+                markup
+            )
+
+            context.application.create_task(
+                crypto_watch(
+                    context.application,
+                    user_id,
+                    plan,
+                    payment_db_id,
+                    invoice_id
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Crypto invoice creation failed"
+            )
+
+            await send_ui(
+                update,
+                context,
+                (
+                    "❌ Не удалось создать счёт.\n\n"
+                    "Попробуйте Telegram Stars."
+                ),
+                kb_pay_methods(plan)
+            )
+
+        return
+
+    # =====================================================
+    # TELEGRAM STARS
+    # =====================================================
+
+    if data.startswith(
+        "pay:stars:"
+    ):
+
+        plan = data.split(":")[-1]
+
+        if plan not in PLANS:
+            return
+
+        p = PLANS[plan]
+
+        payment_db_id = create_payment(
+            user_id,
+            plan,
+            "stars",
+            None
+        )
+
+        context.user_data[
+            "pending_star_payment"
+        ] = payment_db_id
+
+        await safe_delete(
+            q.message
+        )
+
+        try:
+
+            await context.bot.send_invoice(
+                chat_id=user_id,
+                title=p["title"],
+                description=(
+                    "Доступ к функциям бота "
+                    f"на {p['days']} дней."
+                ),
+                payload=(
+                    f"hug:"
+                    f"{user_id}:"
+                    f"{plan}:"
+                    f"{payment_db_id}"
+                ),
+                provider_token="",
+                currency="XTR",
+                prices=[
+                    LabeledPrice(
+                        p["title"],
+                        p["stars"]
+                    )
+                ],
+            )
+
+            await context.bot.send_message(
+                user_id,
+                (
+                    "⭐️ Оплатите счёт выше.\n\n"
+                    "После успешной оплаты "
+                    "подписка активируется "
+                    "автоматически."
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "❌ Отменить",
+                            callback_data="pay:cancel"
+                        )
+                    ]
+                ])
+            )
+
+        except TelegramError:
+
+            logger.exception(
+                "Stars invoice failed"
+            )
+
+            update_payment(
+                payment_db_id,
+                "failed"
+            )
+
+            await context.bot.send_message(
+                user_id,
+                (
+                    "❌ Не удалось создать "
+                    "счёт Stars.\n\n"
+                    "Попробуйте CryptoBot."
+                ),
+                reply_markup=kb_pay_methods(plan)
+            )
+
+        return
+
+    # =====================================================
+    # CANCEL
+    # =====================================================
+
+    if data == "pay:cancel":
+
+        await send_ui(
+            update,
+            context,
+            "❌ Оплата отменена.",
+            kb_home(user_id)
+        )
+
+        return
+
+    # =====================================================
+    # CRYPTO CHECK
+    # =====================================================
+
+    if data.startswith(
+        "check_crypto:"
+    ):
+
+        parts = data.split(":")
+
+        if len(parts) < 4:
+            return
+
+        try:
+
+            invoice_id = parts[1]
+
+            plan = parts[2]
+
+            payment_db_id = int(
+                parts[3]
+            )
+
+        except (
+            ValueError,
+            IndexError
+        ):
+
+            try:
+                await q.answer(
+                    "Некорректные данные оплаты.",
+                    show_alert=True
+                )
+            except TelegramError:
+                pass
+
+            return
+
+        if plan not in PLANS:
+            return
+
+        existing = find_subscription_by_payment(
+            str(invoice_id)
+        )
+
+        if existing:
+
+            await send_ui(
+                update,
+                context,
+                "✅ Оплата уже зачислена.",
+                kb_after_pay(None)
+            )
+
+            return
+
+        if not CRYPTO_PAY_API_TOKEN:
+
+            try:
+                await q.answer(
+                    "Автопроверка не настроена.",
+                    show_alert=True
+                )
+            except TelegramError:
+                pass
+
+            return
+
+        try:
+
+            result = await crypto_api(
+                "getInvoices",
+                {
+                    "invoice_ids":
+                        str(invoice_id)
+                }
+            )
+
+            items = result.get(
+                "items",
+                []
+            )
+
+            if (
+                items
+                and items[0].get("status")
+                == "paid"
+            ):
+
+                await grant_paid_access(
+                    context.bot,
+                    user_id,
+                    plan,
+                    "cryptobot",
+                    str(invoice_id),
+                    payment_db_id
+                )
+
+                await safe_delete(
+                    q.message
+                )
+
+                return
+
+            try:
+                await q.answer(
+                    (
+                        "Оплата ещё не найдена.\n"
+                        "Попробуйте ещё раз."
+                    ),
+                    show_alert=True
+                )
+            except TelegramError:
+                pass
+
+        except Exception:
+
+            logger.exception(
+                "Crypto manual check failed"
+            )
+
+            try:
+                await q.answer(
+                    "Не удалось проверить оплату.",
+                    show_alert=True
+                )
+            except TelegramError:
+                pass
+
+        return
+
+    # =====================================================
+    # MANUAL CRYPTO
+    # =====================================================
+
+    if data.startswith(
+        "manual_crypto:"
+    ):
+
+        plan = data.split(":")[-1]
+
+        await send_ui(
+            update,
+            context,
+            (
+                "⏳ Автоматическая проверка "
+                "доступна после настройки "
+                "CRYPTO_PAY_API_TOKEN."
+            ),
+            kb_back_home()
+        )
+
+
+# =========================================================
+# STARS PRECHECKOUT
 # =========================================================
 
 async def pre_checkout(
@@ -3898,6 +5135,10 @@ async def pre_checkout(
         )
 
 
+# =========================================================
+# SUCCESSFUL STARS PAYMENT
+# =========================================================
+
 async def successful_payment(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -3928,9 +5169,12 @@ async def successful_payment(
 
         return
 
-    _, payload_user, plan, payment_db_id = (
-        parts[:4]
-    )
+    (
+        _,
+        payload_user,
+        plan,
+        payment_db_id
+    ) = parts[:4]
 
     user_id = (
         update.effective_user.id
@@ -3991,15 +5235,49 @@ async def cmd_start(
         update.effective_user.id
     )
 
-    # Только создаём профиль,
-    # если его ещё нет.
-    #
-    # Подписка здесь НЕ удаляется.
     ensure_profile(
         user_id
     )
 
-    # Просто читаем текущую подписку.
+    # ---------------------------------------------
+    # Реферальная ссылка
+    # ---------------------------------------------
+
+    if context.args:
+
+        start_param = (
+            context.args[0]
+        )
+
+        if start_param.startswith(
+            "ref_"
+        ):
+
+            try:
+
+                referrer_id = int(
+                    start_param[4:]
+                )
+
+            except ValueError:
+
+                referrer_id = None
+
+            if (
+                referrer_id
+                and referrer_id != user_id
+            ):
+
+                add_referral(
+                    referrer_id,
+                    user_id
+                )
+
+    # ---------------------------------------------
+    # Проверяем существующую подписку,
+    # но НЕ меняем её
+    # ---------------------------------------------
+
     subscription = (
         get_active_subscription(
             user_id
@@ -4040,7 +5318,37 @@ async def cmd_start(
 
     await update.message.reply_text(
         GREETING,
-        reply_markup=kb_home()
+        reply_markup=kb_home(
+            user_id
+        )
+    )
+
+
+# =========================================================
+# /ADMIN
+# =========================================================
+
+async def cmd_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = (
+        update.effective_user.id
+    )
+
+    if not is_admin(
+        user_id
+    ):
+
+        await update.message.reply_text(
+            "❌ Доступ запрещён."
+        )
+
+        return
+
+    await update.message.reply_text(
+        admin_stats(),
+        reply_markup=kb_admin()
     )
 
 
@@ -4201,7 +5509,7 @@ async def handle_text(
         return
 
     # =====================================================
-    # ПРОМОКОД БЕЗ STATE
+    # PROMO WITHOUT STATE
     # =====================================================
 
     applied = await apply_promo_text(
@@ -4216,7 +5524,9 @@ async def handle_text(
 
     await update.message.reply_text(
         "Не понимаю 🙈 Воспользуйтесь меню.",
-        reply_markup=kb_home()
+        reply_markup=kb_home(
+            user_id
+        )
     )
 
 
@@ -4299,7 +5609,9 @@ async def expiration_loop(
                 "Expiration loop failed"
             )
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(
+            60
+        )
 
 
 # =========================================================
@@ -4356,6 +5668,28 @@ def main():
         CommandHandler(
             "start",
             cmd_start
+        )
+    )
+
+    # =====================================================
+    # ADMIN COMMAND
+    # =====================================================
+
+    app.add_handler(
+        CommandHandler(
+            "admin",
+            cmd_admin
+        )
+    )
+
+    # =====================================================
+    # ADMIN CALLBACKS
+    # =====================================================
+
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_callback,
+            pattern=r"^admin:"
         )
     )
 
