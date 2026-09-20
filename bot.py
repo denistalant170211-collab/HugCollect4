@@ -16,7 +16,6 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from telegram import (
-    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -2300,7 +2299,10 @@ def create_backup_bytes() -> tuple[bytes, str]:
 async def send_backup_to_admin(bot, admin_id: int) -> bool:
     try:
         data, filename = create_backup_bytes()
-        document = BufferedInputFile(data, filename=filename)
+
+        document = io.BytesIO(data)
+        document.name = filename
+
         await bot.send_document(
             chat_id=admin_id,
             document=document,
