@@ -146,6 +146,28 @@ REQUIRED_CHANNEL_ID = (
 
 REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "").strip()
 
+# =========================================================
+# SECURITY / CAPTCHA / MIRRORS
+# =========================================================
+
+CAPTCHA_TTL_SECONDS = max(300, int(os.environ.get("CAPTCHA_TTL_SECONDS", "86400")))
+CAPTCHA_MAX_ATTEMPTS = max(1, int(os.environ.get("CAPTCHA_MAX_ATTEMPTS", "3")))
+RATE_LIMIT_WINDOW_SECONDS = max(5, int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "20")))
+RATE_LIMIT_MAX_UPDATES = max(3, int(os.environ.get("RATE_LIMIT_MAX_UPDATES", "18")))
+MIRROR_CHECK_INTERVAL = max(60, int(os.environ.get("MIRROR_CHECK_INTERVAL", "300")))
+
+ACTIVE_ADMIN_IDS: set[int] = set(ADMIN_IDS)
+USER_RATE_BUCKETS: dict[int, list[float]] = {}
+CURRENT_ADMIN_ID_CONTEXT: dict[str, int] = {}
+
+MAINTENANCE_TEXT = (
+    "🛠 ТЕХНИЧЕСКИЕ РАБОТЫ\n\n"
+    "Бот временно находится на технических работах.\n\n"
+    "Мы уже занимаемся восстановлением доступа. "
+    "Попробуйте немного позже.\n\n"
+    "🌐 Ниже доступны резервные адреса проекта."
+)
+
 
 # =========================================================
 # MODERATION
@@ -245,7 +267,11 @@ PLANS = {
 # TEXT
 # =========================================================
 
-GREETING = "Привет, пользователь!\nЧем я могу вам помочь?"
+GREETING = (
+    "🤖 HUGCOLLECT\n\n"
+    "Добро пожаловать!\n"
+    "Выберите нужный раздел ниже 👇"
+)
 
 SUPPORT_TEXT = (
     f"Если вы столкнулись с проблемой — напишите: {SUPPORT_USERNAME}"
@@ -308,6 +334,471 @@ def db_ping() -> float:
         conn.execute("SELECT 1").fetchone()
 
     return (utcnow() - started).total_seconds() * 1000
+
+
+# =========================================================
+# SECURITY / ADMIN / MAINTENANCE HELPERS
+# =========================================================
+
+def load_admin_ids_from_db() -> None:
+    global ACTIVE_ADMIN_IDS
+    ids = set(ADMIN_IDS)
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT user_id FROM bot_admins").fetchall()
+        ids.update(int(row["user_id"]) for row in rows)
+    except Exception:
+        logger.exception("Could not load dynamic admin IDs")
+    ACTIVE_ADMIN_IDS = ids
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ACTIVE_ADMIN_IDS
+
+
+def is_root_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def meta_get(key: str, default: str = "") -> str:
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=%s", (key,)).fetchone()
+        return str(row["value"]) if row else default
+    except Exception:
+        logger.exception("meta_get failed key=%s", key)
+        return default
+
+
+def meta_set(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO meta(key,value)
+            VALUES(%s,%s)
+            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def maintenance_enabled() -> bool:
+    return meta_get("maintenance_enabled", "0") == "1"
+
+
+def set_maintenance(enabled: bool, admin_id: int | None = None) -> None:
+    meta_set("maintenance_enabled", "1" if enabled else "0")
+    log_event("INFO", "maintenance_changed", admin_id, {"enabled": enabled})
+
+
+def get_user_restriction(user_id: int):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT banned, banned_until, ban_reason
+            FROM profiles
+            WHERE user_id=%s
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def user_is_banned(user_id: int) -> bool:
+    row = get_user_restriction(user_id)
+    if not row or not row["banned"]:
+        return False
+
+    until = aware(row["banned_until"])
+    if until is not None and until <= utcnow():
+        unban_user(user_id, 0)
+        return False
+
+    return True
+
+
+def ban_user(user_id: int, admin_id: int, days: int = 0, reason: str = "") -> None:
+    banned_until = utcnow() + timedelta(days=days) if days > 0 else None
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE profiles
+            SET banned=TRUE,
+                banned_until=%s,
+                ban_reason=%s
+            WHERE user_id=%s
+            """,
+            (banned_until, reason[:500], user_id),
+        )
+        conn.commit()
+    log_event(
+        "INFO",
+        "user_banned",
+        admin_id or None,
+        {"target_user_id": user_id, "days": days, "reason": reason[:500]},
+    )
+
+
+def unban_user(user_id: int, admin_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE profiles
+            SET banned=FALSE,
+                banned_until=NULL,
+                ban_reason=NULL
+            WHERE user_id=%s
+            """,
+            (user_id,),
+        )
+        conn.commit()
+    if admin_id:
+        log_event(
+            "INFO",
+            "user_unbanned",
+            admin_id,
+            {"target_user_id": user_id},
+        )
+
+
+def revoke_subscription(user_id: int, admin_id: int | None = None) -> int:
+    with db() as conn:
+        result = conn.execute(
+            """
+            UPDATE subscriptions
+            SET expires_at=NOW()
+            WHERE user_id=%s
+              AND expires_at > NOW()
+            """,
+            (user_id,),
+        )
+        conn.commit()
+    if admin_id:
+        log_event(
+            "INFO",
+            "subscription_revoked",
+            admin_id,
+            {"target_user_id": user_id, "rows": result.rowcount},
+        )
+    return result.rowcount
+
+
+def grant_admin_subscription(user_id: int, plan: str, admin_id: int):
+    ensure_profile(user_id)
+    payment_key = (
+        f"admin:{admin_id}:{user_id}:{plan}:{int(utcnow().timestamp())}"
+    )
+    expires, _created = activate_subscription(
+        user_id,
+        plan,
+        "admin",
+        payment_key,
+        consume_referral_bonus=False,
+    )
+    log_event(
+        "INFO",
+        "subscription_granted_by_admin",
+        admin_id,
+        {"target_user_id": user_id, "plan": plan, "expires_at": expires.isoformat()},
+    )
+    return expires
+
+
+def get_user_removal_credits(user_id: int) -> int:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT removal_credits FROM profiles WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+    return int(row["removal_credits"] or 0) if row else 0
+
+
+def add_removal_credit_from_captcha(user_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT removal_credits FROM profiles WHERE user_id=%s FOR UPDATE",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return False
+        if int(row["removal_credits"] or 0) > 0:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE profiles SET removal_credits=1 WHERE user_id=%s",
+            (user_id,),
+        )
+        conn.commit()
+    log_event("INFO", "captcha_reward_granted", user_id, {"removal_credits": 1})
+    return True
+
+
+def consume_removal_credit(user_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT removal_credits FROM profiles WHERE user_id=%s FOR UPDATE",
+            (user_id,),
+        ).fetchone()
+        if not row or int(row["removal_credits"] or 0) <= 0:
+            conn.commit()
+            return False
+        conn.execute(
+            """
+            UPDATE profiles
+            SET removal_credits=removal_credits-1,
+                captcha_verified_at=NULL
+            WHERE user_id=%s
+            """,
+            (user_id,),
+        )
+        conn.commit()
+    return True
+
+
+def captcha_is_valid(user_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT captcha_verified_at FROM profiles WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+    if not row or not row["captcha_verified_at"]:
+        return False
+    verified_at = aware(row["captcha_verified_at"])
+    return bool(
+        verified_at
+        and verified_at + timedelta(seconds=CAPTCHA_TTL_SECONDS) > utcnow()
+    )
+
+
+def set_captcha_verified(user_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE profiles SET captcha_verified_at=%s WHERE user_id=%s",
+            (utcnow(), user_id),
+        )
+        conn.commit()
+
+
+def invalidate_captcha(user_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE profiles SET captcha_verified_at=NULL WHERE user_id=%s",
+            (user_id,),
+        )
+        conn.commit()
+
+
+def user_rate_limited(user_id: int) -> bool:
+    now = utcnow().timestamp()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    bucket = USER_RATE_BUCKETS.setdefault(user_id, [])
+    bucket[:] = [stamp for stamp in bucket if stamp >= cutoff]
+    if len(bucket) >= RATE_LIMIT_MAX_UPDATES:
+        return True
+    bucket.append(now)
+    return False
+
+
+def get_bot_admins():
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, added_by, created_at
+            FROM bot_admins
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+
+
+def add_bot_admin(user_id: int, added_by: int) -> bool:
+    ensure_profile(user_id)
+    with db() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO bot_admins(user_id, added_by, created_at)
+            VALUES(%s,%s,%s)
+            ON CONFLICT(user_id) DO NOTHING
+            RETURNING user_id
+            """,
+            (user_id, added_by, utcnow()),
+        ).fetchone()
+        conn.commit()
+    load_admin_ids_from_db()
+    if row:
+        log_event("INFO", "admin_added", added_by, {"target_admin_id": user_id})
+        return True
+    return False
+
+
+def remove_bot_admin(user_id: int, removed_by: int) -> bool:
+    if is_root_admin(user_id):
+        return False
+    with db() as conn:
+        result = conn.execute(
+            "DELETE FROM bot_admins WHERE user_id=%s",
+            (user_id,),
+        )
+        conn.commit()
+    load_admin_ids_from_db()
+    if result.rowcount:
+        log_event("INFO", "admin_removed", removed_by, {"target_admin_id": user_id})
+        return True
+    return False
+
+
+def get_active_mirrors():
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bot_mirrors WHERE active=TRUE ORDER BY id ASC"
+        ).fetchall()
+
+
+def get_all_mirrors():
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bot_mirrors ORDER BY id ASC"
+        ).fetchall()
+
+
+def add_mirror(name: str, url: str) -> bool:
+    name = (name or "").strip()[:100]
+    url = (url or "").strip().rstrip("/")
+    if not name or not re.match(r"^https?://", url, re.IGNORECASE):
+        raise ValueError("Название и URL должны быть заполнены, URL — http(s).")
+    with db() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO bot_mirrors(name,url,active,created_at)
+            VALUES(%s,%s,TRUE,%s)
+            ON CONFLICT(url)
+            DO UPDATE SET name=EXCLUDED.name, active=TRUE
+            RETURNING id
+            """,
+            (name, url, utcnow()),
+        ).fetchone()
+        conn.commit()
+    return bool(row)
+
+
+def deactivate_mirror(mirror_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE bot_mirrors SET active=FALSE WHERE id=%s",
+            (mirror_id,),
+        )
+        conn.commit()
+
+
+def format_mirror_status(row) -> str:
+    if not row["last_checked_at"]:
+        return "⚪ Ещё не проверялось"
+    status = row["last_status"]
+    latency = row["last_latency_ms"]
+    if status is not None and 100 <= int(status) < 500:
+        icon = "🟢"
+    else:
+        icon = "🔴"
+    latency_text = f"{float(latency):.0f} ms" if latency is not None else "—"
+    return f"{icon} HTTP {status or '—'} · {latency_text}"
+
+
+async def check_mirror(url: str):
+    started = utcnow()
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            response = await client.get(url)
+        latency = (utcnow() - started).total_seconds() * 1000
+        return response.status_code, latency
+    except Exception:
+        latency = (utcnow() - started).total_seconds() * 1000
+        return None, latency
+
+
+async def check_all_mirrors() -> None:
+    rows = get_all_mirrors()
+    for row in rows:
+        status, latency = await check_mirror(row["url"])
+        with db() as conn:
+            conn.execute(
+                """
+                UPDATE bot_mirrors
+                SET last_status=%s,
+                    last_latency_ms=%s,
+                    last_checked_at=%s
+                WHERE id=%s
+                """,
+                (status, latency, utcnow(), row["id"]),
+            )
+            conn.commit()
+
+
+def captcha_markup(context: ContextTypes.DEFAULT_TYPE):
+    captcha = context.user_data.get("captcha") or {}
+    options = captcha.get("options") or []
+    rows = []
+    pair = []
+    for value in options:
+        pair.append(
+            InlineKeyboardButton(
+                str(value),
+                callback_data=f"captcha:answer:{value}",
+            )
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([
+        InlineKeyboardButton(
+            "🔄 Новый пример",
+            callback_data="captcha:refresh",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def create_captcha(context: ContextTypes.DEFAULT_TYPE):
+    a = random.randint(2, 9)
+    b = random.randint(1, 9)
+    answer = a + b
+    options = {answer}
+    while len(options) < 4:
+        options.add(max(0, answer + random.randint(-5, 5)))
+    values = list(options)
+    random.shuffle(values)
+    context.user_data["captcha"] = {
+        "answer": answer,
+        "attempts": 0,
+        "created_at": utcnow().timestamp(),
+        "options": values,
+    }
+    return a, b
+
+
+async def show_captcha(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    alert_text: str | None = None,
+):
+    a, b = create_captcha(context)
+    text = (
+        "🛡️ ПРОВЕРКА БЕЗОПАСНОСТИ\n\n"
+        "Подтвердите, что вы человек.\n"
+        "Решите пример:\n\n"
+        f"🧩 {a} + {b} = ?\n\n"
+        "После успешной проверки будет доступна одна попытка обработки."
+    )
+    if alert_text:
+        text = f"{alert_text}\n\n{text}"
+    await send_ui(
+        update,
+        context,
+        text,
+        captcha_markup(context),
+    )
+
 
 
 # =========================================================
@@ -437,7 +928,12 @@ def init_db():
                 ref_code TEXT NOT NULL DEFAULT 'HUGGER',
                 checks INTEGER NOT NULL DEFAULT 0,
                 first_seen_at TIMESTAMPTZ,
-                referral_bonus_days INTEGER NOT NULL DEFAULT 0
+                referral_bonus_days INTEGER NOT NULL DEFAULT 0,
+                captcha_verified_at TIMESTAMPTZ,
+                removal_credits INTEGER NOT NULL DEFAULT 0,
+                banned BOOLEAN NOT NULL DEFAULT FALSE,
+                banned_until TIMESTAMPTZ,
+                ban_reason TEXT
             )
             """
         )
@@ -647,6 +1143,31 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_mirrors (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                last_status INTEGER,
+                last_latency_ms NUMERIC(18,3),
+                last_checked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
         migrations = [
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS username TEXT",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS first_name TEXT",
@@ -658,6 +1179,11 @@ def init_db():
             "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
             "ALTER TABLE payments ADD COLUMN IF NOT EXISTS failure_reason TEXT",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS captcha_verified_at TIMESTAMPTZ",
+            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS removal_credits INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
+            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ban_reason TEXT",
         ]
 
         for sql in migrations:
@@ -733,6 +1259,24 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_moderation_evidence_case "
             "ON moderation_evidence(case_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_profiles_banned "
+            "ON profiles(banned, banned_until)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_mirrors_active "
+            "ON bot_mirrors(active)"
+        )
+
+        for root_admin_id in ADMIN_IDS:
+            conn.execute(
+                """
+                INSERT INTO bot_admins(user_id, added_by, created_at)
+                VALUES(%s,%s,%s)
+                ON CONFLICT(user_id) DO NOTHING
+                """,
+                (root_admin_id, root_admin_id, utcnow()),
+            )
 
         now = utcnow()
 
@@ -781,6 +1325,7 @@ def init_db():
 
         conn.commit()
 
+    load_admin_ids_from_db()
     logger.info("PostgreSQL database initialized")
 
 
@@ -853,21 +1398,22 @@ def ensure_profile(
             ),
         ).fetchone()
 
-        conn.execute(
-            """
-            UPDATE profiles
-            SET username=%s,
-                first_name=%s,
-                last_name=%s
-            WHERE user_id=%s
-            """,
-            (
-                username,
-                first_name,
-                last_name,
-                user_id,
-            ),
-        )
+        if telegram_user is not None:
+            conn.execute(
+                """
+                UPDATE profiles
+                SET username=%s,
+                    first_name=%s,
+                    last_name=%s
+                WHERE user_id=%s
+                """,
+                (
+                    username,
+                    first_name,
+                    last_name,
+                    user_id,
+                ),
+            )
 
         conn.commit()
 
@@ -2812,51 +3358,24 @@ async def apply_promo_text(
 def kb_home(
     user_id: int | None = None,
 ):
-
     rows = [
         [
-            InlineKeyboardButton(
-                "👤 Личный кабинет",
-                callback_data="nav:profile",
-            )
+            InlineKeyboardButton("👤 Кабинет", callback_data="nav:profile"),
+            InlineKeyboardButton("📋 Функции", callback_data="nav:menu"),
         ],
         [
-            InlineKeyboardButton(
-                "📋 Меню",
-                callback_data="nav:menu",
-            )
+            InlineKeyboardButton("👥 Рефералы", callback_data="nav:referrals"),
+            InlineKeyboardButton("💬 Поддержка", callback_data="nav:support"),
         ],
         [
-            InlineKeyboardButton(
-                "👥 Реферальная система",
-                callback_data="nav:referrals",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💬 Техподдержка",
-                callback_data="nav:support",
-            )
+            InlineKeyboardButton("🌐 Зеркала", callback_data="nav:mirrors"),
         ],
     ]
-
-    if (
-        user_id is not None
-        and is_admin(user_id)
-    ):
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🛠 Админ-панель",
-                    callback_data="admin:panel",
-                )
-            ]
-        )
-
-    return InlineKeyboardMarkup(
-        rows
-    )
+    if user_id is not None and is_admin(user_id):
+        rows.append([
+            InlineKeyboardButton("🛠 Админ-панель", callback_data="admin:panel")
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_profile():
@@ -2886,45 +3405,25 @@ def kb_profile():
 
 
 def kb_menu():
-
-    return InlineKeyboardMarkup(
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton(
-                    "sn1cти аккаунт❄️",
-                    callback_data="menu:hug",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👀 П0иск",
-                    callback_data="menu:search",
-                ),
-                InlineKeyboardButton(
-                    "🔎 Проверить",
-                    callback_data="menu:check",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🛡 Модерация / обращения",
-                    callback_data="menu:moderation",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📜 История поиска",
-                    callback_data="menu:history",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 На главную",
-                    callback_data="nav:home",
-                )
-            ],
-        ]
-    )
+            InlineKeyboardButton("🛡 Попытка обработки", callback_data="menu:hug"),
+        ],
+        [
+            InlineKeyboardButton("👀 Поиск", callback_data="menu:search"),
+            InlineKeyboardButton("🔎 Проверка", callback_data="menu:check"),
+        ],
+        [
+            InlineKeyboardButton("🛡 Модерация", callback_data="menu:moderation"),
+            InlineKeyboardButton("📜 История", callback_data="menu:history"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Зеркала", callback_data="nav:mirrors"),
+        ],
+        [
+            InlineKeyboardButton("🏠 На главную", callback_data="nav:home"),
+        ],
+    ])
 
 
 def kb_moderation():
@@ -3031,6 +3530,60 @@ def kb_moderation_evidence(
             ],
         ]
     )
+
+
+def kb_mirrors():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="nav:mirrors")],
+        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+    ])
+
+
+def kb_admin_access():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💎 Выдать подписку", callback_data="admin:grant_sub"),
+            InlineKeyboardButton("❌ Снять подписку", callback_data="admin:revoke_sub"),
+        ],
+        [
+            InlineKeyboardButton("🔨 Забанить", callback_data="admin:ban"),
+            InlineKeyboardButton("✅ Разбанить", callback_data="admin:unban"),
+        ],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin:panel")],
+    ])
+
+
+def kb_admin_admins():
+    rows = []
+    current_id = CURRENT_ADMIN_ID_CONTEXT.get("user_id", 0)
+    if is_root_admin(current_id):
+        rows.append([InlineKeyboardButton("➕ Добавить админа", callback_data="admin:add_admin")])
+        rows.append([InlineKeyboardButton("➖ Удалить админа", callback_data="admin:remove_admin")])
+    rows.append([InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_admin_mirrors():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Добавить зеркало", callback_data="admin:mirror_add"),
+            InlineKeyboardButton("🔎 Проверить", callback_data="admin:mirror_check"),
+        ],
+        [InlineKeyboardButton("❌ Отключить зеркало", callback_data="admin:mirror_off")],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin:panel")],
+    ])
+
+
+def kb_maintenance(enabled: bool):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🟢 Выключить техработы" if enabled else "🔴 Включить техработы",
+                callback_data="admin:maintenance_off" if enabled else "admin:maintenance_on",
+            )
+        ],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin:panel")],
+    ])
 
 
 def kb_back_home():
@@ -3227,89 +3780,40 @@ def kb_referrals():
 
 
 def kb_admin():
-
-    return InlineKeyboardMarkup(
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton(
-                    "📊 Статистика",
-                    callback_data="admin:stats",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пользователи",
-                    callback_data="admin:users",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔎 Найти пользователя",
-                    callback_data="admin:user_search",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💳 Покупки",
-                    callback_data="admin:payments",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔗 Рефералы",
-                    callback_data="admin:referrals",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🎟 Промокоды",
-                    callback_data="admin:promos",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💾 Backup",
-                    callback_data="admin:backup",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❤️ Health",
-                    callback_data="admin:health",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📈 По дням",
-                    callback_data="admin:daily_stats",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧾 Логи",
-                    callback_data="admin:logs",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📢 Рассылка",
-                    callback_data="admin:broadcast",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔄 Обновить",
-                    callback_data="admin:panel",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 На главную",
-                    callback_data="nav:home",
-                )
-            ],
-        ]
-    )
+            InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+            InlineKeyboardButton("👥 Пользователи", callback_data="admin:users"),
+        ],
+        [
+            InlineKeyboardButton("💳 Покупки", callback_data="admin:payments"),
+            InlineKeyboardButton("🔗 Рефералы", callback_data="admin:referrals"),
+        ],
+        [
+            InlineKeyboardButton("🎟 Промокоды", callback_data="admin:promos"),
+            InlineKeyboardButton("📢 Рассылка", callback_data="admin:broadcast"),
+        ],
+        [
+            InlineKeyboardButton("👑 Доступ", callback_data="admin:access"),
+            InlineKeyboardButton("👮 Админы", callback_data="admin:admins"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Зеркала", callback_data="admin:mirrors"),
+            InlineKeyboardButton("🛠 Техработы", callback_data="admin:maintenance"),
+        ],
+        [
+            InlineKeyboardButton("💾 Backup", callback_data="admin:backup"),
+            InlineKeyboardButton("❤️ Health", callback_data="admin:health"),
+        ],
+        [
+            InlineKeyboardButton("📈 По дням", callback_data="admin:daily_stats"),
+            InlineKeyboardButton("🧾 Логи", callback_data="admin:logs"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Обновить", callback_data="admin:panel"),
+            InlineKeyboardButton("🏠 Главная", callback_data="nav:home"),
+        ],
+    ])
 
 
 def kb_admin_promo_list(
@@ -3350,6 +3854,182 @@ def kb_admin_promo_list(
 
     return InlineKeyboardMarkup(
         buttons
+    )
+
+
+# =========================================================
+# MIRRORS / MAINTENANCE / CAPTCHA UI
+# =========================================================
+
+async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_all_mirrors()
+    primary = WEBHOOK_BASE or "https://hugcollect4.onrender.com"
+    lines = [
+        "🌐 ДОСТУП К ПРОЕКТУ",
+        "",
+        "🟢 Основной адрес:",
+        primary,
+        "",
+    ]
+
+    active_found = False
+    for row in rows:
+        if not row["active"]:
+            continue
+        active_found = True
+        lines.extend([
+            f"{format_mirror_status(row)}",
+            f"• {row['name']}",
+            row["url"],
+            "",
+        ])
+
+    if not active_found:
+        lines.append("Резервные адреса пока не добавлены.")
+
+    lines.extend([
+        "",
+        "ℹ️ Зеркала — резервные адреса вашего сервиса.",
+    ])
+
+    await send_ui(update, context, "\n".join(lines), kb_mirrors())
+
+
+async def show_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_active_mirrors()
+    text = MAINTENANCE_TEXT
+    if rows:
+        text += "\n\n🌐 Резервные адреса:\n"
+        for row in rows[:8]:
+            text += f"• {row['name']} — {row['url']}\n"
+    await send_ui(update, context, text, None)
+
+
+async def show_admin_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_ui(
+        update,
+        context,
+        (
+            "👑 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
+            "💎 Выдать подписку\n"
+            "❌ Снять подписку\n"
+            "🔨 Заблокировать пользователя\n"
+            "✅ Разблокировать пользователя"
+        ),
+        kb_admin_access(),
+    )
+
+
+async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    CURRENT_ADMIN_ID_CONTEXT["user_id"] = update.effective_user.id
+    rows = get_bot_admins()
+    lines = ["👮 АДМИНИСТРАТОРЫ\n"]
+    if not rows:
+        lines.append("Администраторов пока нет.")
+    else:
+        for row in rows:
+            role = "👑 ROOT" if is_root_admin(int(row["user_id"])) else "🛡 ADMIN"
+            lines.append(
+                f"{role} — {row['user_id']}\n"
+                f"Добавлен: {aware(row['created_at']).strftime('%d.%m.%Y %H:%M')}"
+            )
+    await send_ui(update, context, "\n\n".join(lines), kb_admin_admins())
+
+
+async def show_admin_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_all_mirrors()
+    lines = ["🌐 ЗЕРКАЛА\n"]
+    if not rows:
+        lines.append("Зеркала ещё не добавлены.")
+    else:
+        for row in rows:
+            active = "🟢" if row["active"] else "⚪"
+            lines.append(
+                f"{active} #{row['id']} — {row['name']}\n"
+                f"{row['url']}\n"
+                f"{format_mirror_status(row)}"
+            )
+    await send_ui(update, context, "\n\n".join(lines), kb_admin_mirrors())
+
+
+async def show_admin_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    enabled = maintenance_enabled()
+    await send_ui(
+        update,
+        context,
+        (
+            "🛠 ТЕХНИЧЕСКИЕ РАБОТЫ\n\n"
+            f"Статус: {'🔴 ВКЛЮЧЕНЫ' if enabled else '🟢 ВЫКЛЮЧЕНЫ'}\n\n"
+            "В режиме техработ обычные пользователи не получают доступ "
+            "к функциям бота."
+        ),
+        kb_maintenance(enabled),
+    )
+
+
+async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user_id = q.from_user.id
+    data = q.data or ""
+
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+
+    if data == "captcha:refresh":
+        await show_captcha(update, context)
+        return
+
+    captcha = context.user_data.get("captcha")
+    if not captcha or not data.startswith("captcha:answer:"):
+        await show_captcha(update, context)
+        return
+
+    try:
+        answer = int(data.rsplit(":", 1)[1])
+    except ValueError:
+        await show_captcha(update, context, "❌ Некорректный ответ.")
+        return
+
+    age = utcnow().timestamp() - float(captcha.get("created_at", 0))
+    if age > CAPTCHA_TTL_SECONDS:
+        context.user_data.pop("captcha", None)
+        await show_captcha(update, context, "⌛ Срок действия капчи истёк.")
+        return
+
+    correct = int(captcha.get("answer", -1))
+    if answer != correct:
+        captcha["attempts"] = int(captcha.get("attempts", 0)) + 1
+        if captcha["attempts"] >= CAPTCHA_MAX_ATTEMPTS:
+            context.user_data.pop("captcha", None)
+            await show_captcha(update, context, "❌ Слишком много ошибок. Создана новая капча.")
+            return
+        left = CAPTCHA_MAX_ATTEMPTS - captcha["attempts"]
+        await show_captcha(
+            update,
+            context,
+            f"❌ Неверно. Осталось попыток: {left}.",
+        )
+        return
+
+    context.user_data.pop("captcha", None)
+    set_captcha_verified(user_id)
+    granted = add_removal_credit_from_captcha(user_id)
+
+    await send_ui(
+        update,
+        context,
+        (
+            "✅ ПРОВЕРКА ПРОЙДЕНА\n\n"
+            + (
+                "🎁 Вам начислена 1 попытка обработки."
+                if granted
+                else "ℹ️ У вас уже есть неиспользованная попытка."
+            )
+            + "\n\nТеперь можно пользоваться меню."
+        ),
+        kb_home(user_id),
     )
 
 
@@ -3442,76 +4122,90 @@ async def channel_gate(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     user = update.effective_user
 
-    if (
-        not REQUIRED_CHANNEL_ID
-        or not user
-        or user.is_bot
-        or is_admin(user.id)
-    ):
+    if not user or user.is_bot:
+        return
+
+    # Commands should reach their dedicated CommandHandlers.
+    if update.message and update.message.text and update.message.text.startswith("/"):
         return
 
     q = update.callback_query
 
-    if q and q.data == "gate:check":
+    if q and (q.data or "").startswith("captcha:"):
+        return
 
-        subscribed = (
-            await is_required_channel_member(
-                context.bot,
-                user.id,
-            )
-        )
-
-        if subscribed:
-
-            try:
-                await q.answer(
-                    "Подписка найдена ✅"
-                )
-            except TelegramError:
-                pass
-
-            await show_home(
-                update,
-                context,
-            )
-
-        else:
-
-            try:
-                await q.answer(
-                    "Вы ещё не подписались.",
-                    show_alert=True,
-                )
-            except TelegramError:
-                pass
-
-            await show_channel_gate(
-                update,
-                context,
-            )
-
-        raise ApplicationHandlerStop
-
+    # Payment updates must not be blocked by captcha/maintenance/channel gates.
     if update.pre_checkout_query:
         return
-
-    if (
-        update.message
-        and update.message.successful_payment
-    ):
+    if update.message and update.message.successful_payment:
         return
 
-    if await is_required_channel_member(
-        context.bot,
-        user.id,
-    ):
+    ensure_profile(user.id, user)
+
+    if is_admin(user.id):
+        return
+
+    if user_is_banned(user.id):
+        row = get_user_restriction(user.id)
+        until = aware(row["banned_until"]) if row else None
+        until_text = until.strftime("%d.%m.%Y %H:%M") if until else "навсегда"
+        await send_ui(
+            update,
+            context,
+            (
+                "⛔ ДОСТУП ОГРАНИЧЕН\n\n"
+                f"Срок: {until_text}\n"
+                f"Причина: {(row['ban_reason'] if row else '') or 'не указана'}"
+            ),
+            None,
+        )
+        raise ApplicationHandlerStop
+
+    if maintenance_enabled():
+        await show_maintenance(update, context)
+        raise ApplicationHandlerStop
+
+    if user_rate_limited(user.id):
+        invalidate_captcha(user.id)
+        await show_captcha(
+            update,
+            context,
+            "⚠️ Слишком много действий. Пройдите проверку снова.",
+        )
+        raise ApplicationHandlerStop
+
+    if not captcha_is_valid(user.id):
+        await show_captcha(update, context)
+        raise ApplicationHandlerStop
+
+    if not REQUIRED_CHANNEL_ID:
+        return
+
+    if q and q.data == "gate:check":
+        subscribed = await is_required_channel_member(
+            context.bot,
+            user.id,
+        )
+        if subscribed:
+            try:
+                await q.answer("Подписка найдена ✅")
+            except TelegramError:
+                pass
+            await show_home(update, context)
+        else:
+            try:
+                await q.answer("Вы ещё не подписались.", show_alert=True)
+            except TelegramError:
+                pass
+            await show_channel_gate(update, context)
+        raise ApplicationHandlerStop
+
+    if await is_required_channel_member(context.bot, user.id):
         return
 
     if q:
-
         try:
             await q.answer(
                 "Сначала подпишитесь на канал.",
@@ -3520,11 +4214,7 @@ async def channel_gate(
         except TelegramError:
             pass
 
-    await show_channel_gate(
-        update,
-        context,
-    )
-
+    await show_channel_gate(update, context)
     raise ApplicationHandlerStop
 
 
@@ -3784,7 +4474,8 @@ def profile_caption(
         f"{bonus_text}\n"
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/"
-        f"{DAILY_REQUEST_LIMIT}"
+        f"{DAILY_REQUEST_LIMIT}\n"
+        f"🛡 Попыток доступно — {get_user_removal_credits(user_id)}"
     )
 
 
@@ -3799,67 +4490,45 @@ async def run_hug_animation(
     user_id: int,
     target: str,
 ):
-
-    count = 356
-
     try:
-
         await asyncio.sleep(1)
-
-        for percent in [
-            8,
-            20,
-            34,
-            49,
-            68,
-            71,
-            90,
-        ]:
-
+        for percent in [12, 25, 41, 58, 73, 89]:
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"💤{percent}%💤",
             )
-
             await asyncio.sleep(1)
 
         await bot.send_message(
             chat_id=chat_id,
             text="💤100%💤",
         )
+        await asyncio.sleep(0.5)
 
-        await asyncio.sleep(
-            0.5
-        )
-
-        add_hug(
+        add_hug(user_id, target, 1)
+        log_event(
+            "INFO",
+            "simulated_processing_attempt",
             user_id,
-            target,
-            count,
+            {"target": target},
         )
 
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⭕️Отправлено жалоб — "
-                f"{count}⭕️"
+                "✅ Попытка обработки завершена.\n\n"
+                "ℹ️ Массовая отправка жалоб не выполняется.\n"
+                "Для реального обращения используйте раздел «🛡 Модерация»."
             ),
             reply_markup=kb_hooray(),
         )
-
     except Exception:
-
-        logger.exception(
-            "Hug animation failed"
-        )
-
+        logger.exception("Hug animation failed")
         log_event(
             "ERROR",
             "hug_animation_failed",
             user_id,
-            {
-                "target": target,
-            },
+            {"target": target},
         )
 
 
@@ -3868,24 +4537,34 @@ async def start_hug(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
 ):
-
-    if not await require_subscription(
-        update,
-        context,
-        user_id,
-    ):
+    if not await require_subscription(update, context, user_id):
         return
 
-    context.user_data["state"] = (
-        "awaiting_hug_target"
-    )
+    if not captcha_is_valid(user_id):
+        await show_captcha(update, context)
+        return
 
+    if get_user_removal_credits(user_id) <= 0:
+        await send_ui(
+            update,
+            context,
+            (
+                "🛡️ ПОПЫТКА ОБРАБОТКИ\n\n"
+                "Доступных попыток нет.\n\n"
+                "Пройдите капчу, чтобы получить одну попытку."
+            ),
+            kb_home(user_id),
+        )
+        return
+
+    context.user_data["state"] = "awaiting_hug_target"
     await send_ui(
         update,
         context,
         (
-            "Введите @username или ID "
-            "аккаунта который будет sнесён"
+            "🛡️ ОДНА ПОПЫТКА ОБРАБОТКИ\n\n"
+            "Введите @username или публичную ссылку.\n\n"
+            "⚠️ Это симуляция процесса. Массовая отправка жалоб не выполняется."
         ),
         kb_back_home(),
     )
@@ -3896,93 +4575,62 @@ async def confirm_and_send_hug(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
 ):
-
-    if not await require_subscription(
-        update,
-        context,
-        user_id,
-    ):
-
+    if not await require_subscription(update, context, user_id):
         context.user_data["state"] = None
-
         return
 
-    ok, _used = request_usage(
-        user_id
-    )
-
-    if not ok:
-
+    if not captcha_is_valid(user_id):
         context.user_data["state"] = None
+        await show_captcha(update, context)
+        return
 
+    target = context.user_data.get("hug_target", "объект")
+
+    if get_user_removal_credits(user_id) <= 0:
+        context.user_data["state"] = None
+        await send_ui(update, context, "❌ Доступная попытка уже использована.", kb_home(user_id))
+        return
+
+    ok, _used = request_usage(user_id)
+    if not ok:
+        context.user_data["state"] = None
         await send_ui(
             update,
             context,
-            (
-                "⛔️ Лимит на сегодня исчерпан.\n\n"
-                f"Доступно {DAILY_REQUEST_LIMIT} "
-                "запросов в день."
-            ),
+            f"⛔️ Лимит на сегодня исчерпан.\n\nДоступно {DAILY_REQUEST_LIMIT} запросов в день.",
             kb_menu(),
         )
+        return
 
+    if not consume_removal_credit(user_id):
+        context.user_data["state"] = None
+        await send_ui(update, context, "❌ Попытка уже использована.", kb_home(user_id))
         return
 
     context.user_data["state"] = None
-
-    target = context.user_data.pop(
-        "hug_target",
-        "другу",
-    )
+    context.user_data.pop("hug_target", None)
 
     initial_text = (
-        "💤Идет процесс отправления жалоб 💤\n\n"
+        "💤 Идёт обработка 💤\n\n"
         "3%\n\n"
-        "🔰Ожидание до 1 минуты🔰"
+        "🔰 Выполняется одна попытка 🔰"
     )
 
-    chat_id = (
-        update.effective_chat.id
-    )
-
+    chat_id = update.effective_chat.id
     q = update.callback_query
 
     if q and q.message:
-
         try:
-
-            await q.message.edit_text(
-                initial_text
-            )
-
-            msg_id = (
-                q.message.message_id
-            )
-
+            await q.message.edit_text(initial_text)
+            msg_id = q.message.message_id
         except BadRequest:
-
-            msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=initial_text,
-            )
-
+            msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
             msg_id = msg.message_id
-
     elif update.message:
-
-        msg = await update.message.reply_text(
-            initial_text
-        )
-
+        msg = await update.message.reply_text(initial_text)
         msg_id = msg.message_id
-
     else:
-
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=initial_text,
-        )
-
+        msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
         msg_id = msg.message_id
 
     context.application.create_task(
@@ -4823,6 +5471,12 @@ def admin_stats() -> str:
             FROM moderation_cases
             """
         ).fetchone()["total"]
+        banned_users = conn.execute(
+            "SELECT COUNT(*) AS total FROM profiles WHERE banned=TRUE"
+        ).fetchone()["total"]
+        active_mirrors = conn.execute(
+            "SELECT COUNT(*) AS total FROM bot_mirrors WHERE active=TRUE"
+        ).fetchone()["total"]
 
         week = conn.execute(
             """
@@ -4880,6 +5534,8 @@ def admin_stats() -> str:
         f"• Всего проверок — {checks}\n"
         f"• Всего поисков — {searches}\n"
         f"• Обращений — {moderation}\n\n"
+        f"• Заблокированных — {banned_users}\n"
+        f"• Активных зеркал — {active_mirrors}\n"
         "📅 Последние 7 дней\n"
         f"• Новых — {week['users']}\n"
         f"• Запросов — {week['requests']}\n"
@@ -5285,6 +5941,8 @@ def create_backup_bytes() -> tuple[
         "channel_revocations",
         "moderation_cases",
         "moderation_evidence",
+        "bot_admins",
+        "bot_mirrors",
     ]
 
     payload = {
@@ -6854,6 +7512,13 @@ async def nav_callback(
             context,
         )
 
+    elif data == "nav:mirrors":
+
+        await show_mirrors(
+            update,
+            context,
+        )
+
     elif data == "menu:hug":
 
         await start_hug(
@@ -7410,6 +8075,7 @@ async def admin_callback(
     q = update.callback_query
 
     user_id = q.from_user.id
+    CURRENT_ADMIN_ID_CONTEXT["user_id"] = user_id
 
     if not is_admin(user_id):
 
@@ -7578,6 +8244,103 @@ async def admin_callback(
             context,
         )
 
+    elif data == "admin:access":
+        await show_admin_access(update, context)
+
+    elif data == "admin:grant_sub":
+        context.user_data["state"] = "admin_grant_sub"
+        await send_ui(
+            update,
+            context,
+            (
+                "💎 ВЫДАТЬ ПОДПИСКУ\n\n"
+                "Формат:\nUSER_ID PLAN\n\n"
+                "Пример: 123456789 month\n\n"
+                "Доступно: week / month / year"
+            ),
+            kb_admin_access(),
+        )
+
+    elif data == "admin:revoke_sub":
+        context.user_data["state"] = "admin_revoke_sub"
+        await send_ui(
+            update,
+            context,
+            "❌ СНЯТЬ ПОДПИСКУ\n\nВведите Telegram ID пользователя:",
+            kb_admin_access(),
+        )
+
+    elif data == "admin:ban":
+        context.user_data["state"] = "admin_ban"
+        await send_ui(
+            update,
+            context,
+            (
+                "🔨 ЗАБАНИТЬ ПОЛЬЗОВАТЕЛЯ\n\n"
+                "Формат:\nUSER_ID DAYS REASON\n\n"
+                "DAYS=0 — навсегда."
+            ),
+            kb_admin_access(),
+        )
+
+    elif data == "admin:unban":
+        context.user_data["state"] = "admin_unban"
+        await send_ui(
+            update,
+            context,
+            "✅ РАЗБАНИТЬ\n\nВведите Telegram ID пользователя:",
+            kb_admin_access(),
+        )
+
+    elif data == "admin:admins":
+        await show_admin_admins(update, context)
+
+    elif data == "admin:add_admin":
+        if not is_root_admin(user_id):
+            await q.answer("Только root-администратор может менять список админов.", show_alert=True)
+            return
+        context.user_data["state"] = "admin_add_admin"
+        await send_ui(update, context, "➕ ДОБАВИТЬ АДМИНА\n\nВведите Telegram ID:", kb_admin_admins())
+
+    elif data == "admin:remove_admin":
+        if not is_root_admin(user_id):
+            await q.answer("Только root-администратор может менять список админов.", show_alert=True)
+            return
+        context.user_data["state"] = "admin_remove_admin"
+        await send_ui(update, context, "➖ УДАЛИТЬ АДМИНА\n\nВведите Telegram ID:", kb_admin_admins())
+
+    elif data == "admin:mirrors":
+        await show_admin_mirrors(update, context)
+
+    elif data == "admin:mirror_add":
+        context.user_data["state"] = "admin_mirror_add"
+        await send_ui(
+            update,
+            context,
+            "➕ ДОБАВИТЬ ЗЕРКАЛО\n\nФормат:\nНазвание | URL",
+            kb_admin_mirrors(),
+        )
+
+    elif data == "admin:mirror_check":
+        await send_ui(update, context, "🔎 Проверяю зеркала...", kb_admin_mirrors())
+        await check_all_mirrors()
+        await show_admin_mirrors(update, context)
+
+    elif data == "admin:mirror_off":
+        context.user_data["state"] = "admin_mirror_off"
+        await send_ui(update, context, "❌ ОТКЛЮЧИТЬ ЗЕРКАЛО\n\nВведите ID зеркала:", kb_admin_mirrors())
+
+    elif data == "admin:maintenance":
+        await show_admin_maintenance(update, context)
+
+    elif data == "admin:maintenance_on":
+        set_maintenance(True, user_id)
+        await show_admin_maintenance(update, context)
+
+    elif data == "admin:maintenance_off":
+        set_maintenance(False, user_id)
+        await show_admin_maintenance(update, context)
+
     elif data == "admin:backup":
 
         await send_ui(
@@ -7644,61 +8407,50 @@ async def cmd_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
-    user_id = (
-        update.effective_user.id
-    )
-
-    ensure_profile(
-        user_id,
-        update.effective_user,
-    )
+    user_id = update.effective_user.id
+    ensure_profile(user_id, update.effective_user)
 
     if context.args:
-
         start_param = context.args[0]
-
-        if start_param.startswith(
-            "ref_"
-        ):
-
+        if start_param.startswith("ref_"):
             try:
-
-                referrer_id = int(
-                    start_param[4:]
-                )
-
+                referrer_id = int(start_param[4:])
             except ValueError:
-
                 referrer_id = None
+            if referrer_id and referrer_id != user_id:
+                add_referral(referrer_id, user_id)
 
-            if (
-                referrer_id
-                and referrer_id != user_id
-            ):
-
-                add_referral(
-                    referrer_id,
-                    user_id,
-                )
-
-    subscription = get_active_subscription(
-        user_id
-    )
-
+    subscription = get_active_subscription(user_id)
     logger.info(
-        "START: user=%s "
-        "active_subscription=%s",
+        "START: user=%s active_subscription=%s",
         user_id,
         bool(subscription),
     )
 
     context.user_data["state"] = None
+    context.user_data.pop("hug_target", None)
 
-    context.user_data.pop(
-        "hug_target",
-        None,
-    )
+    if not is_admin(user_id):
+        if user_is_banned(user_id):
+            row = get_user_restriction(user_id)
+            until = aware(row["banned_until"]) if row else None
+            until_text = until.strftime("%d.%m.%Y %H:%M") if until else "навсегда"
+            await update.message.reply_text(
+                (
+                    "⛔ ДОСТУП ОГРАНИЧЕН\n\n"
+                    f"Срок: {until_text}\n"
+                    f"Причина: {(row['ban_reason'] if row else '') or 'не указана'}"
+                )
+            )
+            return
+
+        if maintenance_enabled():
+            await show_maintenance(update, context)
+            return
+
+        if not captcha_is_valid(user_id):
+            await show_captcha(update, context)
+            return
 
     await update.message.reply_text(
         "Меню перенесено в сообщение 👇",
@@ -8029,6 +8781,169 @@ async def handle_text(
             reply_markup=kb_admin(),
         )
 
+        return
+
+    # ---------------------------------------------
+    # ADMIN SUBSCRIPTION / BAN / ADMINS / MIRRORS
+    # ---------------------------------------------
+
+    if is_admin(user_id) and state == "admin_grant_sub":
+        context.user_data["state"] = None
+        parts = text.split()
+        if len(parts) != 2 or parts[1].lower() not in PLANS:
+            await update.message.reply_text(
+                "❌ Формат: USER_ID PLAN\nПример: 123456789 month",
+                reply_markup=kb_admin_access(),
+            )
+            return
+        try:
+            target_id = int(parts[0])
+        except ValueError:
+            await update.message.reply_text("❌ USER_ID должен быть числом.", reply_markup=kb_admin_access())
+            return
+        ensure_profile(target_id)
+        plan = parts[1].lower()
+        expires = grant_admin_subscription(target_id, plan, user_id)
+        try:
+            await context.bot.send_message(
+                target_id,
+                (
+                    "💎 Вам выдана подписка администратором.\n\n"
+                    f"План: {PLANS[plan]['title']}\n"
+                    f"До: {expires.strftime('%d.%m.%Y %H:%M')}"
+                ),
+            )
+        except TelegramError:
+            pass
+        await update.message.reply_text(
+            f"✅ Подписка выдана пользователю {target_id}.\nДо: {expires.strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=kb_admin_access(),
+        )
+        return
+
+    if is_admin(user_id) and state == "admin_revoke_sub":
+        context.user_data["state"] = None
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=kb_admin_access())
+            return
+        count = revoke_subscription(target_id, user_id)
+        try:
+            await context.bot.send_message(target_id, "❌ Ваша подписка была отменена администратором.")
+        except TelegramError:
+            pass
+        await update.message.reply_text(
+            f"✅ Завершено активных подписок: {count}",
+            reply_markup=kb_admin_access(),
+        )
+        return
+
+    if is_admin(user_id) and state == "admin_ban":
+        context.user_data["state"] = None
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2:
+            await update.message.reply_text("❌ Формат: USER_ID DAYS REASON", reply_markup=kb_admin_access())
+            return
+        try:
+            target_id = int(parts[0])
+            days = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("❌ USER_ID и DAYS должны быть числами.", reply_markup=kb_admin_access())
+            return
+        if target_id in ACTIVE_ADMIN_IDS:
+            await update.message.reply_text("❌ Нельзя заблокировать администратора.", reply_markup=kb_admin_access())
+            return
+        reason = parts[2] if len(parts) == 3 else ""
+        ensure_profile(target_id)
+        ban_user(target_id, user_id, max(0, days), reason)
+        revoke_subscription(target_id, user_id)
+        try:
+            await context.bot.send_message(target_id, "⛔ Доступ к боту ограничен администратором.")
+        except TelegramError:
+            pass
+        until_text = "навсегда" if days <= 0 else f"на {days} дн."
+        await update.message.reply_text(
+            f"✅ Пользователь {target_id} заблокирован {until_text}.",
+            reply_markup=kb_admin_access(),
+        )
+        return
+
+    if is_admin(user_id) and state == "admin_unban":
+        context.user_data["state"] = None
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=kb_admin_access())
+            return
+        unban_user(target_id, user_id)
+        try:
+            await context.bot.send_message(target_id, "✅ Ограничение снято. Доступ восстановлен.")
+        except TelegramError:
+            pass
+        await update.message.reply_text(f"✅ Пользователь {target_id} разблокирован.", reply_markup=kb_admin_access())
+        return
+
+    if is_admin(user_id) and state == "admin_add_admin":
+        context.user_data["state"] = None
+        if not is_root_admin(user_id):
+            await update.message.reply_text("❌ Только root-администратор.", reply_markup=kb_admin())
+            return
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=kb_admin_admins())
+            return
+        added = add_bot_admin(target_id, user_id)
+        await update.message.reply_text(
+            "✅ Администратор добавлен." if added else "ℹ️ Пользователь уже является администратором.",
+            reply_markup=kb_admin_admins(),
+        )
+        return
+
+    if is_admin(user_id) and state == "admin_remove_admin":
+        context.user_data["state"] = None
+        if not is_root_admin(user_id):
+            await update.message.reply_text("❌ Только root-администратор.", reply_markup=kb_admin())
+            return
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=kb_admin_admins())
+            return
+        if is_root_admin(target_id):
+            await update.message.reply_text("❌ Root-администраторов из ENV удалить нельзя.", reply_markup=kb_admin_admins())
+            return
+        removed = remove_bot_admin(target_id, user_id)
+        await update.message.reply_text(
+            "✅ Администратор удалён." if removed else "❌ Администратор не найден.",
+            reply_markup=kb_admin_admins(),
+        )
+        return
+
+    if is_admin(user_id) and state == "admin_mirror_add":
+        context.user_data["state"] = None
+        if "|" not in text:
+            await update.message.reply_text("❌ Формат: Название | URL", reply_markup=kb_admin_mirrors())
+            return
+        name, url = text.split("|", 1)
+        try:
+            add_mirror(name, url)
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ {exc}", reply_markup=kb_admin_mirrors())
+            return
+        await update.message.reply_text("✅ Зеркало сохранено.", reply_markup=kb_admin_mirrors())
+        return
+
+    if is_admin(user_id) and state == "admin_mirror_off":
+        context.user_data["state"] = None
+        try:
+            mirror_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=kb_admin_mirrors())
+            return
+        deactivate_mirror(mirror_id)
+        await update.message.reply_text(f"✅ Зеркало #{mirror_id} отключено.", reply_markup=kb_admin_mirrors())
         return
 
     # ---------------------------------------------
@@ -8951,6 +9866,21 @@ async def auto_backup_loop(
 
 
 # =========================================================
+# MIRROR MONITOR
+# =========================================================
+
+async def mirror_monitor_loop(application: Application):
+    while True:
+        try:
+            await check_all_mirrors()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Mirror monitor loop failed")
+        await asyncio.sleep(MIRROR_CHECK_INTERVAL)
+
+
+# =========================================================
 # POST INIT
 # =========================================================
 
@@ -8972,6 +9902,12 @@ async def post_init(
 
     application.create_task(
         auto_backup_loop(
+            application
+        )
+    )
+
+    application.create_task(
+        mirror_monitor_loop(
             application
         )
     )
@@ -9087,6 +10023,13 @@ def main():
         CommandHandler(
             "user",
             cmd_user,
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            captcha_callback,
+            pattern=r"^captcha:",
         )
     )
 
