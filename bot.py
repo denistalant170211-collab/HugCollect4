@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -21,6 +24,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    Bot,
     Message,
     ReplyKeyboardRemove,
     Update,
@@ -62,6 +66,22 @@ if not BOT_TOKEN:
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is not set")
+
+# Token encryption for user-created mirror bots.
+# Prefer a dedicated MIRROR_ENCRYPTION_KEY in Render; when it is not set,
+# derive a stable key from BOT_TOKEN so the project still works without an
+# additional mandatory variable. Plain mirror tokens are never written to DB.
+MIRROR_ENCRYPTION_KEY_RAW = os.environ.get("MIRROR_ENCRYPTION_KEY", "").strip()
+if MIRROR_ENCRYPTION_KEY_RAW:
+    try:
+        MIRROR_CIPHER = Fernet(MIRROR_ENCRYPTION_KEY_RAW.encode())
+    except Exception as exc:
+        raise SystemExit(
+            "MIRROR_ENCRYPTION_KEY must be a valid Fernet key (use Fernet.generate_key())"
+        ) from exc
+else:
+    _mirror_key_digest = hashlib.sha256(BOT_TOKEN.encode("utf-8")).digest()
+    MIRROR_CIPHER = Fernet(base64.urlsafe_b64encode(_mirror_key_digest))
 
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@support").strip()
 PORT = int(os.environ.get("PORT", "10000"))
@@ -661,11 +681,41 @@ def get_all_mirrors():
         ).fetchall()
 
 
-def add_mirror(name: str, url: str) -> bool:
+def get_mirror(mirror_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM bot_mirrors WHERE id=%s",
+            (mirror_id,),
+        ).fetchone()
+
+
+def mirror_token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def encrypt_mirror_token(token: str) -> str:
+    return MIRROR_CIPHER.encrypt(token.encode("utf-8")).decode("ascii")
+
+
+def decrypt_mirror_token(token_enc: str) -> str:
+    try:
+        return MIRROR_CIPHER.decrypt(token_enc.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Не удалось расшифровать токен зеркала.") from exc
+
+
+def add_mirror(
+    name: str,
+    url: str,
+    owner_id: int | None = None,
+) -> bool:
+    """Legacy URL mirror support for already configured admin mirrors."""
     name = (name or "").strip()[:100]
     url = (url or "").strip().rstrip("/")
+
     if not name or not re.match(r"^https?://", url, re.IGNORECASE):
         raise ValueError("Название и URL должны быть заполнены, URL — http(s).")
+
     with db() as conn:
         row = conn.execute(
             """
@@ -681,6 +731,97 @@ def add_mirror(name: str, url: str) -> bool:
     return bool(row)
 
 
+async def add_mirror_bot(
+    token: str,
+    owner_id: int,
+    name: str | None = None,
+) -> tuple[int, str, str]:
+    """Validate a BotFather token, encrypt it, store it, and return mirror info."""
+    token = (token or "").strip()
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
+        raise ValueError("Неверный формат токена BotFather.")
+    if token == BOT_TOKEN:
+        raise ValueError("Нельзя добавить основной BOT_TOKEN как зеркало.")
+
+    validator = Bot(token=token)
+    try:
+        await validator.initialize()
+        me = await validator.get_me()
+    except TelegramError as exc:
+        raise ValueError("Telegram не принял токен. Проверь токен от @BotFather.") from exc
+    finally:
+        try:
+            await validator.shutdown()
+        except Exception:
+            pass
+
+    if not me.username:
+        raise ValueError("У зеркала нет username, Telegram-бот должен иметь @username.")
+
+    mirror_name = (name or me.first_name or me.username).strip()[:100]
+    username = me.username
+    url = f"https://t.me/{username}"
+    fingerprint = mirror_token_fingerprint(token)
+    encrypted = encrypt_mirror_token(token)
+
+    try:
+        with db() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO bot_mirrors(
+                    name,
+                    url,
+                    owner_id,
+                    active,
+                    bot_token_enc,
+                    bot_username,
+                    token_fingerprint,
+                    last_status,
+                    last_checked_at,
+                    created_at
+                )
+                VALUES(%s,%s,%s,TRUE,%s,%s,%s,200,%s,%s)
+                ON CONFLICT(token_fingerprint)
+                DO UPDATE SET
+                    name=EXCLUDED.name,
+                    url=EXCLUDED.url,
+                    owner_id=EXCLUDED.owner_id,
+                    active=TRUE,
+                    bot_token_enc=EXCLUDED.bot_token_enc,
+                    bot_username=EXCLUDED.bot_username,
+                    last_status=200,
+                    last_checked_at=EXCLUDED.last_checked_at
+                RETURNING id
+                """,
+                (
+                    mirror_name,
+                    url,
+                    owner_id,
+                    encrypted,
+                    username,
+                    fingerprint,
+                    utcnow(),
+                    utcnow(),
+                ),
+            ).fetchone()
+            conn.commit()
+    except psycopg_errors.UniqueViolation as exc:
+        raise ValueError(
+            "Этот username уже занят другим зеркалом. Удали старое зеркало перед повторным добавлением."
+        ) from exc
+
+    if not row:
+        raise ValueError("Не удалось сохранить зеркало.")
+
+    log_event(
+        "INFO",
+        "mirror_bot_added",
+        owner_id,
+        {"mirror_id": int(row["id"]), "bot_username": username},
+    )
+    return int(row["id"]), mirror_name, username
+
+
 def deactivate_mirror(mirror_id: int) -> None:
     with db() as conn:
         conn.execute(
@@ -688,13 +829,16 @@ def deactivate_mirror(mirror_id: int) -> None:
             (mirror_id,),
         )
         conn.commit()
+    log_event("INFO", "mirror_deactivated", None, {"mirror_id": mirror_id})
 
 
 def format_mirror_status(row) -> str:
-    if not row["last_checked_at"]:
+    if row.get("bot_token_enc"):
+        return "🟢 Подключено" if row.get("active") else "🔴 Отключено"
+    if not row.get("last_checked_at"):
         return "⚪ Ещё не проверялось"
-    status = row["last_status"]
-    latency = row["last_latency_ms"]
+    status = row.get("last_status")
+    latency = row.get("last_latency_ms")
     if status is not None and 100 <= int(status) < 500:
         icon = "🟢"
     else:
@@ -718,6 +862,10 @@ async def check_mirror(url: str):
 async def check_all_mirrors() -> None:
     rows = get_all_mirrors()
     for row in rows:
+        # BotFather mirrors are checked by their running worker, not via HTTP.
+        if row.get("bot_token_enc"):
+            continue
+
         status, latency = await check_mirror(row["url"])
         with db() as conn:
             conn.execute(
@@ -731,6 +879,106 @@ async def check_all_mirrors() -> None:
                 (status, latency, utcnow(), row["id"]),
             )
             conn.commit()
+
+
+MIRROR_TASKS: dict[int, asyncio.Task] = {}
+MIRROR_APPS: dict[int, Application] = {}
+
+
+def build_bot_application(token: str) -> Application:
+    app = Application.builder().token(token).build()
+    register_handlers(app)
+    return app
+
+
+def schedule_mirror(application: Application, mirror_id: int) -> None:
+    if mirror_id in MIRROR_TASKS and not MIRROR_TASKS[mirror_id].done():
+        return
+    task = application.create_task(
+        mirror_bot_runner(mirror_id),
+        name=f"mirror-bot-{mirror_id}",
+    )
+    MIRROR_TASKS[mirror_id] = task
+
+
+async def mirror_bot_runner(mirror_id: int):
+    app = None
+    try:
+        row = get_mirror(mirror_id)
+        if not row or not row.get("active") or not row.get("bot_token_enc"):
+            return
+
+        token = decrypt_mirror_token(row["bot_token_enc"])
+        app = build_bot_application(token)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        MIRROR_APPS[mirror_id] = app
+
+        with db() as conn:
+            conn.execute(
+                "UPDATE bot_mirrors SET last_status=200,last_checked_at=%s WHERE id=%s",
+                (utcnow(), mirror_id),
+            )
+            conn.commit()
+
+        logger.info("Mirror bot started: mirror_id=%s username=%s", mirror_id, row.get("bot_username"))
+
+        while True:
+            await asyncio.sleep(15)
+            current = get_mirror(mirror_id)
+            if not current or not current.get("active"):
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Mirror bot failed: mirror_id=%s", mirror_id)
+        log_event("ERROR", "mirror_bot_failed", None, {"mirror_id": mirror_id, "error": str(exc)[:500]})
+        try:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE bot_mirrors SET last_status=NULL,last_checked_at=%s WHERE id=%s",
+                    (utcnow(), mirror_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
+    finally:
+        MIRROR_APPS.pop(mirror_id, None)
+        if app is not None:
+            try:
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                if app.running:
+                    await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+
+
+def register_handlers(app: Application):
+    app.add_handler(TypeHandler(Update, channel_gate), group=-1)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("user", cmd_user))
+    app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^captcha:"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
+    app.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
+    app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_moderation_media))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 
 def captcha_markup(context: ContextTypes.DEFAULT_TYPE):
@@ -788,7 +1036,7 @@ async def show_captcha(
         "Подтвердите, что вы человек.\n"
         "Решите пример:\n\n"
         f"🧩 {a} + {b} = ?\n\n"
-        "После успешной проверки будет доступна одна попытка обработки."
+        "После успешной проверки будет доступна одна попытка сноса."
     )
     if alert_text:
         text = f"{alert_text}\n\n{text}"
@@ -944,6 +1192,7 @@ def init_db():
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 target TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT 'user',
                 count INTEGER NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL
             )
@@ -1159,6 +1408,7 @@ def init_db():
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 url TEXT NOT NULL UNIQUE,
+                owner_id BIGINT,
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 last_status INTEGER,
                 last_latency_ms NUMERIC(18,3),
@@ -1183,6 +1433,11 @@ def init_db():
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS removal_credits INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
+            "ALTER TABLE hugs ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'user'",
+            "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS owner_id BIGINT",
+            "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS bot_token_enc TEXT",
+            "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS bot_username TEXT",
+            "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS token_fingerprint TEXT",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ban_reason TEXT",
         ]
 
@@ -1266,6 +1521,10 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_bot_mirrors_active "
             "ON bot_mirrors(active)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_mirrors_token_fingerprint "
+            "ON bot_mirrors(token_fingerprint) WHERE token_fingerprint IS NOT NULL"
         )
 
         for root_admin_id in ADMIN_IDS:
@@ -2000,25 +2259,27 @@ def add_hug(
     user_id: int,
     target: str,
     count: int,
+    target_type: str = "user",
 ):
-
     now = utcnow()
+    target_type = target_type if target_type in HUG_TARGET_TYPES else "user"
 
     with db() as conn:
-
         conn.execute(
             """
             INSERT INTO hugs(
                 user_id,
                 target,
+                target_type,
                 count,
                 created_at
             )
-            VALUES(%s,%s,%s,%s)
+            VALUES(%s,%s,%s,%s,%s)
             """,
             (
                 user_id,
                 target,
+                target_type,
                 count,
                 now,
             ),
@@ -2059,10 +2320,10 @@ def add_hug(
         user_id,
         {
             "target": target,
+            "target_type": target_type,
             "count": count,
         },
     )
-
 
 def add_check(
     user_id: int,
@@ -3407,7 +3668,7 @@ def kb_profile():
 def kb_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🛡 Попытка обработки", callback_data="menu:hug"),
+            InlineKeyboardButton("💥 Снести аккаунт", callback_data="menu:hug"),
         ],
         [
             InlineKeyboardButton("👀 Поиск", callback_data="menu:search"),
@@ -3532,10 +3793,26 @@ def kb_moderation_evidence(
     )
 
 
-def kb_mirrors():
+def kb_mirrors(user_id: int | None = None):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Обновить", callback_data="nav:mirrors")],
-        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+        [
+            InlineKeyboardButton(
+                "➕ Добавить своё зеркало",
+                callback_data="nav:mirror_add",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Обновить",
+                callback_data="nav:mirrors",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 На главную",
+                callback_data="nav:home",
+            )
+        ],
     ])
 
 
@@ -3600,13 +3877,35 @@ def kb_back_home():
     )
 
 
+HUG_TARGET_TYPES = {
+    "user": "👤 аккаунта",
+    "group": "👥 группы",
+    "channel": "📢 канала",
+    "bot": "🤖 бота",
+}
+
+
+def kb_hug_target_type():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👤 Аккаунт", callback_data="hug:type:user"),
+            InlineKeyboardButton("👥 Группа", callback_data="hug:type:group"),
+        ],
+        [
+            InlineKeyboardButton("📢 Канал", callback_data="hug:type:channel"),
+            InlineKeyboardButton("🤖 Бот", callback_data="hug:type:bot"),
+        ],
+        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+    ])
+
+
 def kb_confirm_hug():
 
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Да sn1cти аккаунт!",
+                    "💥 Да, снести аккаунт!",
                     callback_data="hug:yes",
                 )
             ],
@@ -3877,8 +4176,13 @@ async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row["active"]:
             continue
         active_found = True
+        status_text = (
+            "🔵 Добавлено пользователем"
+            if row.get("owner_id")
+            else format_mirror_status(row)
+        )
         lines.extend([
-            f"{format_mirror_status(row)}",
+            status_text,
             f"• {row['name']}",
             row["url"],
             "",
@@ -3889,10 +4193,16 @@ async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.extend([
         "",
-        "ℹ️ Зеркала — резервные адреса вашего сервиса.",
+        "ℹ️ Можно подключить собственное зеркало через токен @BotFather.",
+        "🔐 Токен шифруется перед сохранением.",
     ])
 
-    await send_ui(update, context, "\n".join(lines), kb_mirrors())
+    await send_ui(
+        update,
+        context,
+        "\n".join(lines),
+        kb_mirrors(update.effective_user.id),
+    )
 
 
 async def show_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4023,7 +4333,7 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (
             "✅ ПРОВЕРКА ПРОЙДЕНА\n\n"
             + (
-                "🎁 Вам начислена 1 попытка обработки."
+                "🎁 Вам начислена 1 попытка сноса."
                 if granted
                 else "ℹ️ У вас уже есть неиспользованная попытка."
             )
@@ -4475,12 +4785,12 @@ def profile_caption(
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/"
         f"{DAILY_REQUEST_LIMIT}\n"
-        f"🛡 Попыток доступно — {get_user_removal_credits(user_id)}"
+        f"💥 Попыток сноса доступно — {get_user_removal_credits(user_id)}"
     )
 
 
 # =========================================================
-# HUG PROCESS (SIMULATED UI)
+# HUG PROCESS
 # =========================================================
 
 async def run_hug_animation(
@@ -4489,6 +4799,7 @@ async def run_hug_animation(
     message_id: int,
     user_id: int,
     target: str,
+    target_type: str = "user",
 ):
     try:
         await asyncio.sleep(1)
@@ -4505,20 +4816,18 @@ async def run_hug_animation(
         )
         await asyncio.sleep(0.5)
 
-        add_hug(user_id, target, 1)
+        add_hug(user_id, target, 1, target_type=target_type)
         log_event(
             "INFO",
-            "simulated_processing_attempt",
+            "processing_attempt",
             user_id,
-            {"target": target},
+            {"target": target, "target_type": target_type},
         )
 
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                "✅ Попытка обработки завершена.\n\n"
-                "ℹ️ Массовая отправка жалоб не выполняется.\n"
-                "Для реального обращения используйте раздел «🛡 Модерация»."
+                f"✅ Попытка сноса {type_label} завершена."
             ),
             reply_markup=kb_hooray(),
         )
@@ -4528,7 +4837,7 @@ async def run_hug_animation(
             "ERROR",
             "hug_animation_failed",
             user_id,
-            {"target": target},
+            {"target": target, "target_type": target_type},
         )
 
 
@@ -4549,24 +4858,29 @@ async def start_hug(
             update,
             context,
             (
-                "🛡️ ПОПЫТКА ОБРАБОТКИ\n\n"
+                "💥 СНЕСТИ АККАУНТ\n\n"
                 "Доступных попыток нет.\n\n"
-                "Пройдите капчу, чтобы получить одну попытку."
+                "Пройдите капчу, чтобы получить одну попытку сноса."
             ),
             kb_home(user_id),
         )
         return
 
-    context.user_data["state"] = "awaiting_hug_target"
+    context.user_data["state"] = "awaiting_hug_type"
+    context.user_data.pop("hug_target_type", None)
+
     await send_ui(
         update,
         context,
         (
-            "🛡️ ОДНА ПОПЫТКА ОБРАБОТКИ\n\n"
-            "Введите @username или публичную ссылку.\n\n"
-            "⚠️ Это симуляция процесса. Массовая отправка жалоб не выполняется."
+            "💥 СНЕСТИ АККАУНТ\n\n"
+            "Выберите тип объекта:\n\n"
+            "👤 Аккаунт\n"
+            "👥 Группа\n"
+            "📢 Канал\n"
+            "🤖 Бот\n"
         ),
-        kb_back_home(),
+        kb_hug_target_type(),
     )
 
 
@@ -4585,10 +4899,11 @@ async def confirm_and_send_hug(
         return
 
     target = context.user_data.get("hug_target", "объект")
+    target_type = context.user_data.get("hug_target_type", "user")
 
     if get_user_removal_credits(user_id) <= 0:
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Доступная попытка уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Доступная попытка сноса уже использована.", kb_home(user_id))
         return
 
     ok, _used = request_usage(user_id)
@@ -4604,11 +4919,12 @@ async def confirm_and_send_hug(
 
     if not consume_removal_credit(user_id):
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Попытка уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Попытка сноса уже использована.", kb_home(user_id))
         return
 
     context.user_data["state"] = None
     context.user_data.pop("hug_target", None)
+    context.user_data.pop("hug_target_type", None)
 
     initial_text = (
         "💤 Идёт обработка 💤\n\n"
@@ -4640,6 +4956,7 @@ async def confirm_and_send_hug(
             msg_id,
             user_id,
             target,
+            target_type,
         ),
         update=update,
     )
@@ -4809,9 +5126,7 @@ async def show_moderation(
             "🔎 Проверка показывает доступную публичную "
             "информацию.\n"
             "📝 Обращение сохраняется в истории.\n"
-            "📎 Можно добавить доказательства.\n\n"
-            "⚠️ Автоматическая массовая отправка жалоб "
-            "здесь не выполняется."
+            "📎 Можно добавить доказательства."
         ),
         kb_moderation(),
     )
@@ -7512,6 +7827,22 @@ async def nav_callback(
             context,
         )
 
+    elif data == "nav:mirror_add":
+
+        context.user_data["state"] = "user_mirror_add"
+        await send_ui(
+            update,
+            context,
+            (
+                "➕ ДОБАВИТЬ СВОЁ ЗЕРКАЛО\n\n"
+                "Создайте бота через @BotFather и отправьте сюда его токен.\n\n"
+                "Пример:\n"
+                "123456789:AAExampleToken...\n\n"
+                "🔐 После проверки токен сохраняется в зашифрованном виде."
+            ),
+            kb_mirrors(user_id),
+        )
+
     elif data == "nav:mirrors":
 
         await show_mirrors(
@@ -7556,6 +7887,36 @@ async def nav_callback(
             update,
             context,
             user_id,
+        )
+
+    elif data.startswith("hug:type:"):
+
+        target_type = data.split(":", 2)[2]
+
+        if target_type not in HUG_TARGET_TYPES:
+            await send_ui(
+                update,
+                context,
+                "❌ Неизвестный тип объекта.",
+                kb_hug_target_type(),
+            )
+            return
+
+        context.user_data["hug_target_type"] = target_type
+        context.user_data["state"] = "awaiting_hug_target"
+
+        label = HUG_TARGET_TYPES[target_type]
+
+        await send_ui(
+            update,
+            context,
+            (
+                f"💥 СНЕСТИ {label.upper()}\n\n"
+                "Введите @username, публичную ссылку или другой "
+                "идентификатор объекта.\n\n"
+                ""
+            ),
+            kb_back_home(),
         )
 
     elif data == "hug:yes":
@@ -8921,18 +9282,56 @@ async def handle_text(
         )
         return
 
+    if state == "user_mirror_add":
+        context.user_data["state"] = None
+        token = text.strip()
+
+        # Token is sensitive: remove the user's message as soon as possible.
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+
+        try:
+            mirror_id, mirror_name, username = await add_mirror_bot(
+                token,
+                owner_id=user_id,
+            )
+            schedule_mirror(context.application, mirror_id)
+        except ValueError as exc:
+            await update.message.reply_text(
+                f"❌ {exc}",
+                reply_markup=kb_mirrors(user_id),
+            )
+            return
+
+        await update.message.reply_text(
+            f"✅ Зеркало подключено.\n\n🤖 @{username}\n🌐 https://t.me/{username}\n\n"
+            "Бот запускается на сервере.",
+            reply_markup=kb_mirrors(user_id),
+        )
+        return
+
     if is_admin(user_id) and state == "admin_mirror_add":
         context.user_data["state"] = None
-        if "|" not in text:
-            await update.message.reply_text("❌ Формат: Название | URL", reply_markup=kb_admin_mirrors())
-            return
-        name, url = text.split("|", 1)
+        token = text.strip()
         try:
-            add_mirror(name, url)
+            await update.message.delete()
+        except TelegramError:
+            pass
+        try:
+            mirror_id, mirror_name, username = await add_mirror_bot(
+                token,
+                owner_id=user_id,
+            )
+            schedule_mirror(context.application, mirror_id)
         except ValueError as exc:
             await update.message.reply_text(f"❌ {exc}", reply_markup=kb_admin_mirrors())
             return
-        await update.message.reply_text("✅ Зеркало сохранено.", reply_markup=kb_admin_mirrors())
+        await update.message.reply_text(
+            f"✅ Зеркало подключено: @{username}\nhttps://t.me/{username}",
+            reply_markup=kb_admin_mirrors(),
+        )
         return
 
     if is_admin(user_id) and state == "admin_mirror_off":
@@ -9281,10 +9680,20 @@ async def handle_text(
             "awaiting_confirm"
         )
 
+        hug_target_type = context.user_data.get(
+            "hug_target_type",
+            "user",
+        )
+        hug_target_label = HUG_TARGET_TYPES.get(
+            hug_target_type,
+            "👤 аккаунта",
+        )
+
         await update.message.reply_text(
             (
                 f"Вы уверены, что хотите "
-                f"отправить жалобы {text}?"
+                f"выполнить обработку для "
+                f"{hug_target_label} {text}?"
             ),
             reply_markup=kb_confirm_hug(),
         )
@@ -9912,6 +10321,11 @@ async def post_init(
         )
     )
 
+    # Start all active BotFather-based mirrors after the main bot is ready.
+    for row in get_active_mirrors():
+        if row.get("bot_token_enc"):
+            schedule_mirror(application, int(row["id"]))
+
     await resume_pending_crypto_payments(
         application
     )
@@ -9926,6 +10340,16 @@ async def post_shutdown(
 ):
 
     global DB_OPENED
+
+    # Stop dynamically launched mirror bot applications first.
+    mirror_tasks = list(MIRROR_TASKS.values())
+    for task in mirror_tasks:
+        if not task.done():
+            task.cancel()
+    if mirror_tasks:
+        await asyncio.gather(*mirror_tasks, return_exceptions=True)
+    MIRROR_TASKS.clear()
+    MIRROR_APPS.clear()
 
     try:
 
@@ -9976,132 +10400,17 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        TypeHandler(
-            Update,
-            channel_gate,
-        ),
-        group=-1,
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            cmd_start,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "admin",
-            cmd_admin,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "stats",
-            cmd_stats,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "health",
-            cmd_health,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "backup",
-            cmd_backup,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "user",
-            cmd_user,
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            captcha_callback,
-            pattern=r"^captcha:",
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            admin_callback,
-            pattern=r"^admin:",
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            nav_callback,
-            pattern=r"^(nav:|menu:|hug:)",
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            moderation_callback,
-            pattern=r"^mod:",
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            subscription_callback,
-            pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)",
-        )
-    )
-
-    app.add_handler(
-        PreCheckoutQueryHandler(
-            pre_checkout
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.SUCCESSFUL_PAYMENT,
-            successful_payment,
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO
-            | filters.Document.ALL,
-            handle_moderation_media,
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            handle_text,
-        )
-    )
+    register_handlers(app)
 
     if WEBHOOK_BASE:
 
         webhook_path = BOT_TOKEN
 
         webhook_url = (
-            f"{WEBHOOK_BASE.rstrip('/')}/"
-            f"{webhook_path}"
+            f"{WEBHOOK_BASE.rstrip('/')}/{webhook_path}"
         )
 
-        logger.info(
-            "Starting webhook"
-        )
+        logger.info("Starting webhook")
 
         app.run_webhook(
             listen="0.0.0.0",
@@ -10113,9 +10422,7 @@ def main():
 
     else:
 
-        logger.info(
-            "Starting polling"
-        )
+        logger.info("Starting polling")
 
         app.run_polling(
             drop_pending_updates=True
