@@ -178,8 +178,12 @@ REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "").strip()
 # =========================================================
 # The app uses Supabase Storage only for persistent .session files.
 # Actual reporting/sending actions are intentionally not implemented here.
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+# Prefer the current server-side secret key name, but keep compatibility
+# with the legacy service_role variable used by older Supabase projects.
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_SERVER_KEY = SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY
 SUPABASE_SESSIONS_BUCKET = os.environ.get(
     "SUPABASE_SESSIONS_BUCKET",
     "internal-sessions",
@@ -201,15 +205,21 @@ INTERNAL_SESSION_CACHE_DIR = Path(
 INTERNAL_SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 SUPABASE_CLIENT = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    try:
-        SUPABASE_CLIENT = create_client(
-            SUPABASE_URL,
-            SUPABASE_SERVICE_ROLE_KEY,
+if SUPABASE_URL and SUPABASE_SERVER_KEY:
+    if not SUPABASE_URL.startswith(("https://", "http://")):
+        logger.error(
+            "Invalid SUPABASE_URL. Expected the Supabase Project URL like "
+            "https://<project-ref>.supabase.co, NOT DATABASE_URL/postgresql://..."
         )
-    except Exception:
-        logger.exception("Could not initialize Supabase Storage client")
-        SUPABASE_CLIENT = None
+    else:
+        try:
+            SUPABASE_CLIENT = create_client(
+                SUPABASE_URL,
+                SUPABASE_SERVER_KEY,
+            )
+        except Exception:
+            logger.exception("Could not initialize Supabase Storage client")
+            SUPABASE_CLIENT = None
 
 
 def internal_storage_ready() -> bool:
@@ -222,11 +232,9 @@ def internal_storage_ready() -> bool:
 
 
 # =========================================================
-# SECURITY / CAPTCHA / MIRRORS
+# SECURITY / MIRRORS
 # =========================================================
 
-CAPTCHA_TTL_SECONDS = max(300, int(os.environ.get("CAPTCHA_TTL_SECONDS", "86400")))
-CAPTCHA_MAX_ATTEMPTS = max(1, int(os.environ.get("CAPTCHA_MAX_ATTEMPTS", "3")))
 RATE_LIMIT_WINDOW_SECONDS = max(5, int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "20")))
 RATE_LIMIT_MAX_UPDATES = max(3, int(os.environ.get("RATE_LIMIT_MAX_UPDATES", "18")))
 MIRROR_CHECK_INTERVAL = max(60, int(os.environ.get("MIRROR_CHECK_INTERVAL", "300")))
@@ -608,88 +616,11 @@ def grant_admin_subscription(user_id: int, plan: str, admin_id: int):
     return expires
 
 
-def get_user_removal_credits(user_id: int) -> int:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT removal_credits FROM profiles WHERE user_id=%s",
-            (user_id,),
-        ).fetchone()
-    return int(row["removal_credits"] or 0) if row else 0
-
-
-def add_removal_credit_from_captcha(user_id: int) -> bool:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT removal_credits FROM profiles WHERE user_id=%s FOR UPDATE",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            conn.commit()
-            return False
-        if int(row["removal_credits"] or 0) > 0:
-            conn.commit()
-            return False
-        conn.execute(
-            "UPDATE profiles SET removal_credits=1 WHERE user_id=%s",
-            (user_id,),
-        )
-        conn.commit()
-    log_event("INFO", "captcha_reward_granted", user_id, {"removal_credits": 1})
-    return True
-
-
-def consume_removal_credit(user_id: int) -> bool:
-    """Consume the available work credit without resetting captcha verification."""
-    with db() as conn:
-        row = conn.execute(
-            "SELECT removal_credits FROM profiles WHERE user_id=%s FOR UPDATE",
-            (user_id,),
-        ).fetchone()
-        if not row or int(row["removal_credits"] or 0) <= 0:
-            conn.commit()
-            return False
-        conn.execute(
-            """
-            UPDATE profiles
-            SET removal_credits=removal_credits-1
-            WHERE user_id=%s
-            """,
-            (user_id,),
-        )
-        conn.commit()
-    return True
-
-
-def captcha_is_valid(user_id: int) -> bool:
-    """Return True after the user has passed the captcha once.
-
-    The verification is persistent in PostgreSQL and does not expire.
-    This means each Telegram user solves the captcha only once.
-    """
-    with db() as conn:
-        row = conn.execute(
-            "SELECT captcha_verified_at FROM profiles WHERE user_id=%s",
-            (user_id,),
-        ).fetchone()
-    return bool(row and row["captcha_verified_at"])
-
-
-def set_captcha_verified(user_id: int) -> None:
-    with db() as conn:
-        conn.execute(
-            "UPDATE profiles SET captcha_verified_at=%s WHERE user_id=%s",
-            (utcnow(), user_id),
-        )
-        conn.commit()
-
-
-def invalidate_captcha(user_id: int) -> None:
-    with db() as conn:
-        conn.execute(
-            "UPDATE profiles SET captcha_verified_at=NULL WHERE user_id=%s",
-            (user_id,),
-        )
-        conn.commit()
+def get_user_remaining_requests(user_id: int) -> int:
+    """Return remaining daily request quota for an active subscriber."""
+    if not has_subscription(user_id):
+        return 0
+    return max(0, DAILY_REQUEST_LIMIT - usage_today(user_id))
 
 
 def user_rate_limited(user_id: int) -> bool:
@@ -1097,7 +1028,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("user", cmd_user))
-    app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^captcha:"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
     app.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
@@ -1108,72 +1038,6 @@ def register_handlers(app: Application):
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_moderation_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-
-def captcha_markup(context: ContextTypes.DEFAULT_TYPE):
-    captcha = context.user_data.get("captcha") or {}
-    options = captcha.get("options") or []
-    rows = []
-    pair = []
-    for value in options:
-        pair.append(
-            InlineKeyboardButton(
-                str(value),
-                callback_data=f"captcha:answer:{value}",
-            )
-        )
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([
-        InlineKeyboardButton(
-            "🔄 Новый пример",
-            callback_data="captcha:refresh",
-        )
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def create_captcha(context: ContextTypes.DEFAULT_TYPE):
-    a = random.randint(2, 9)
-    b = random.randint(1, 9)
-    answer = a + b
-    options = {answer}
-    while len(options) < 4:
-        options.add(max(0, answer + random.randint(-5, 5)))
-    values = list(options)
-    random.shuffle(values)
-    context.user_data["captcha"] = {
-        "answer": answer,
-        "attempts": 0,
-        "created_at": utcnow().timestamp(),
-        "options": values,
-    }
-    return a, b
-
-
-async def show_captcha(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    alert_text: str | None = None,
-):
-    a, b = create_captcha(context)
-    text = (
-        "🛡️ ПРОВЕРКА БЕЗОПАСНОСТИ\n\n"
-        "Подтвердите, что вы человек.\n"
-        "Решите пример:\n\n"
-        f"🧩 {a} + {b} = ?\n\n"
-        "После успешной проверки будет доступна работа."
-    )
-    if alert_text:
-        text = f"{alert_text}\n\n{text}"
-    await send_ui(
-        update,
-        context,
-        text,
-        captcha_markup(context),
-    )
 
 
 
@@ -1305,8 +1169,6 @@ def init_db():
                 checks INTEGER NOT NULL DEFAULT 0,
                 first_seen_at TIMESTAMPTZ,
                 referral_bonus_days INTEGER NOT NULL DEFAULT 0,
-                captcha_verified_at TIMESTAMPTZ,
-                removal_credits INTEGER NOT NULL DEFAULT 0,
                 banned BOOLEAN NOT NULL DEFAULT FALSE,
                 banned_until TIMESTAMPTZ,
                 ban_reason TEXT
@@ -1592,8 +1454,6 @@ def init_db():
             "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
             "ALTER TABLE payments ADD COLUMN IF NOT EXISTS failure_reason TEXT",
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS captcha_verified_at TIMESTAMPTZ",
-            "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS removal_credits INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
             "ALTER TABLE hugs ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'user'",
@@ -4662,7 +4522,7 @@ def kb_admin_promo_list(
 
 
 # =========================================================
-# MIRRORS / MAINTENANCE / CAPTCHA UI
+# MIRRORS / MAINTENANCE
 # =========================================================
 
 async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4775,61 +4635,6 @@ async def show_admin_maintenance(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    user_id = q.from_user.id
-    data = q.data or ""
-
-    try:
-        await q.answer()
-    except TelegramError:
-        pass
-
-    if data == "captcha:refresh":
-        await show_captcha(update, context)
-        return
-
-    captcha = context.user_data.get("captcha")
-    if not captcha or not data.startswith("captcha:answer:"):
-        await show_captcha(update, context)
-        return
-
-    try:
-        answer = int(data.rsplit(":", 1)[1])
-    except ValueError:
-        await show_captcha(update, context, "❌ Некорректный ответ.")
-        return
-
-    age = utcnow().timestamp() - float(captcha.get("created_at", 0))
-    if age > CAPTCHA_TTL_SECONDS:
-        context.user_data.pop("captcha", None)
-        await show_captcha(update, context, "⌛ Срок действия капчи истёк.")
-        return
-
-    correct = int(captcha.get("answer", -1))
-    if answer != correct:
-        captcha["attempts"] = int(captcha.get("attempts", 0)) + 1
-        if captcha["attempts"] >= CAPTCHA_MAX_ATTEMPTS:
-            context.user_data.pop("captcha", None)
-            await show_captcha(update, context, "❌ Слишком много ошибок. Создана новая капча.")
-            return
-        left = CAPTCHA_MAX_ATTEMPTS - captcha["attempts"]
-        await show_captcha(
-            update,
-            context,
-            f"❌ Неверно. Осталось попыток: {left}.",
-        )
-        return
-
-    context.user_data.pop("captcha", None)
-    set_captcha_verified(user_id)
-
-    await send_ui(
-        update,
-        context,
-        "✅ ПРОВЕРКА ПРОЙДЕНА\n\nТеперь можно пользоваться меню.",
-        kb_home(user_id),
-    )
 
 
 # =========================================================
@@ -4930,12 +4735,7 @@ async def channel_gate(
     if update.message and update.message.text and update.message.text.startswith("/"):
         return
 
-    q = update.callback_query
-
-    if q and (q.data or "").startswith("captcha:"):
-        return
-
-    # Payment updates must not be blocked by captcha/maintenance/channel gates.
+    # Payment updates must not be blocked by maintenance/channel gates.
     if update.pre_checkout_query:
         return
     if update.message and update.message.successful_payment:
@@ -5276,7 +5076,7 @@ def profile_caption(
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/"
         f"{DAILY_REQUEST_LIMIT}\n"
-        f"🚀 Работ доступно — {get_user_removal_credits(user_id)}"
+        f"🚀 Работ доступно — {get_user_remaining_requests(user_id)}"
     )
 
 
@@ -5386,14 +5186,14 @@ async def start_hug(
     if not await require_subscription(update, context, user_id):
         return
 
-    if get_user_removal_credits(user_id) <= 0:
+    if get_user_remaining_requests(user_id) <= 0:
         await send_ui(
             update,
             context,
             (
                 "🚀 НАЧАТЬ РАБОТУ\n\n"
-                "Доступных попыток нет.\n\n"
-                "После проверки вам будет доступна работа."
+                "Лимит запросов на сегодня исчерпан.\n\n"
+                f"Доступно: {DAILY_REQUEST_LIMIT} запросов в день."
             ),
             kb_home(user_id),
         )
@@ -5429,9 +5229,9 @@ async def confirm_and_send_hug(
     target = context.user_data.get("hug_target", "объект")
     target_type = context.user_data.get("hug_target_type", "user")
 
-    if get_user_removal_credits(user_id) <= 0:
+    if get_user_remaining_requests(user_id) <= 0:
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Доступная работа уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Лимит запросов на сегодня исчерпан.", kb_home(user_id))
         return
 
     ok, _used = request_usage(user_id)
@@ -5443,11 +5243,6 @@ async def confirm_and_send_hug(
             f"⛔️ Лимит на сегодня исчерпан.\n\nДоступно {DAILY_REQUEST_LIMIT} запросов в день.",
             kb_menu(),
         )
-        return
-
-    if not consume_removal_credit(user_id):
-        context.user_data["state"] = None
-        await send_ui(update, context, "❌ Работа уже запущена.", kb_home(user_id))
         return
 
     context.user_data["state"] = None
@@ -9617,10 +9412,6 @@ async def cmd_start(
 
         if maintenance_enabled():
             await show_maintenance(update, context)
-            return
-
-        if not captcha_is_valid(user_id):
-            await show_captcha(update, context)
             return
 
     await update.message.reply_text(
