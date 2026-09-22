@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
+from supabase import create_client
+from telethon import TelegramClient
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -172,6 +174,54 @@ REQUIRED_CHANNEL_ID = (
 REQUIRED_CHANNEL_URL = os.environ.get("REQUIRED_CHANNEL_URL", "").strip()
 
 # =========================================================
+# INTERNAL SESSION STORAGE
+# =========================================================
+# The app uses Supabase Storage only for persistent .session files.
+# Actual reporting/sending actions are intentionally not implemented here.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_SESSIONS_BUCKET = os.environ.get(
+    "SUPABASE_SESSIONS_BUCKET",
+    "internal-sessions",
+).strip()
+
+TELEGRAM_API_ID_RAW = os.environ.get("TELEGRAM_API_ID", "").strip()
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+try:
+    TELEGRAM_API_ID = int(TELEGRAM_API_ID_RAW) if TELEGRAM_API_ID_RAW else 0
+except ValueError:
+    TELEGRAM_API_ID = 0
+
+INTERNAL_SESSION_CACHE_DIR = Path(
+    os.environ.get(
+        "INTERNAL_SESSION_CACHE_DIR",
+        "/tmp/darkcollect_sessions",
+    ).strip()
+)
+INTERNAL_SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+SUPABASE_CLIENT = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        SUPABASE_CLIENT = create_client(
+            SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY,
+        )
+    except Exception:
+        logger.exception("Could not initialize Supabase Storage client")
+        SUPABASE_CLIENT = None
+
+
+def internal_storage_ready() -> bool:
+    return bool(
+        SUPABASE_CLIENT
+        and SUPABASE_SESSIONS_BUCKET
+        and TELEGRAM_API_ID
+        and TELEGRAM_API_HASH
+    )
+
+
+# =========================================================
 # SECURITY / CAPTCHA / MIRRORS
 # =========================================================
 
@@ -200,11 +250,39 @@ MAINTENANCE_TEXT = (
 
 MODERATION_REASONS = {
     "spam": "🚫 Спам",
-    "scam": "🎣 Мошенничество / фишинг",
-    "copyright": "©️ Нарушение авторских прав",
-    "impersonation": "👤 Выдача себя за другого",
-    "illegal": "⚠️ Потенциально запрещённый контент",
+    "violence": "⚠️ Насилие",
+    "pornography": "🔞 Порнография",
+    "child_abuse": "🚸 Жестокое обращение с детьми",
     "other": "📝 Другое",
+    "copyright": "©️ Авторские права",
+    "geo_irrelevant": "📍 Нерелевантная геогруппа",
+    "fake": "👤 Выдача себя за другого",
+    "illegal_drugs": "💊 Незаконные наркотики",
+    "personal_details": "🔐 Раскрытие персональных данных",
+}
+
+INTERNAL_TARGET_TYPES = {
+    "bot": "🤖 Бот",
+    "channel": "📢 Канал",
+    "group": "👥 Группа",
+}
+
+INTERNAL_VISIBILITIES = {
+    "public": "🌐 Публичный",
+    "private": "🔒 Приватный",
+}
+
+INTERNAL_REASON_TEMPLATES = {
+    "spam": "Прошу проверить объект на признаки спама.\n\nОбъект: {target}",
+    "violence": "Прошу проверить объект на материалы с пропагандой или описанием насилия.\n\nОбъект: {target}",
+    "pornography": "Прошу проверить объект на порнографический контент.\n\nОбъект: {target}",
+    "child_abuse": "Прошу проверить объект на материалы, связанные с жестоким обращением с детьми.\n\nОбъект: {target}",
+    "other": "Прошу проверить объект по указанному пользователем основанию.\n\nОбъект: {target}",
+    "copyright": "Прошу проверить объект на возможное нарушение авторских прав.\n\nОбъект: {target}",
+    "geo_irrelevant": "Прошу проверить объект на нерелевантное географическое содержание.\n\nОбъект: {target}",
+    "fake": "Прошу проверить объект на выдачу себя за другое лицо или организацию.\n\nОбъект: {target}",
+    "illegal_drugs": "Прошу проверить объект на материалы, связанные с незаконными наркотиками.\n\nОбъект: {target}",
+    "personal_details": "Прошу проверить объект на раскрытие персональных данных.\n\nОбъект: {target}",
 }
 
 
@@ -1023,6 +1101,7 @@ def register_handlers(app: Application):
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
     app.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
+    app.add_handler(CallbackQueryHandler(internal_callback, pattern=r"^internal:"))
     app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
@@ -1443,6 +1522,41 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS internal_jobs (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                target TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                text_mode TEXT NOT NULL,
+                prepared_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'prepared',
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS internal_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                storage_path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                telegram_user_id BIGINT,
+                username TEXT,
+                first_name TEXT,
+                last_error TEXT,
+                last_checked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS bot_admins (
                 user_id BIGINT PRIMARY KEY,
                 added_by BIGINT,
@@ -1562,6 +1676,19 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_moderation_evidence_case "
             "ON moderation_evidence(case_id)"
+        )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_internal_jobs_user "
+            "ON internal_jobs(user_id, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_internal_jobs_status "
+            "ON internal_jobs(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_internal_sessions_status "
+            "ON internal_sessions(status)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_profiles_banned "
@@ -3599,6 +3726,270 @@ def admin_create_promo(
         conn.commit()
 
 
+def _storage_list_session_files_sync() -> list[str]:
+    if not SUPABASE_CLIENT:
+        return []
+
+    response = SUPABASE_CLIENT.storage.from_(SUPABASE_SESSIONS_BUCKET).list(
+        "",
+        {
+            "limit": 1000,
+            "offset": 0,
+            "sortBy": {"column": "name", "order": "asc"},
+        },
+    )
+
+    names: list[str] = []
+    for item in response or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name.lower().endswith(".session") and not name.startswith("."):
+            names.append(name)
+    return names
+
+
+async def list_internal_session_files() -> list[str]:
+    if not internal_storage_ready():
+        return []
+    try:
+        return await asyncio.to_thread(
+            _storage_list_session_files_sync
+        )
+    except Exception:
+        logger.exception("Could not list session files from Supabase Storage")
+        return []
+
+
+def _download_internal_session_sync(
+    storage_path: str,
+    local_path: Path,
+) -> None:
+    if not SUPABASE_CLIENT:
+        raise RuntimeError("Supabase Storage не настроен.")
+
+    payload = SUPABASE_CLIENT.storage.from_(
+        SUPABASE_SESSIONS_BUCKET
+    ).download(storage_path)
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(payload)
+
+
+async def download_internal_session(storage_path: str) -> Path:
+    safe_name = Path(storage_path).name
+    local_path = INTERNAL_SESSION_CACHE_DIR / safe_name
+    await asyncio.to_thread(
+        _download_internal_session_sync,
+        storage_path,
+        local_path,
+    )
+    return local_path
+
+
+async def check_internal_session(
+    storage_path: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "storage_path": storage_path,
+        "status": "error",
+        "telegram_user_id": None,
+        "username": None,
+        "first_name": None,
+        "error": None,
+    }
+
+    if not internal_storage_ready():
+        result["status"] = "not_configured"
+        result["error"] = (
+            "Нужно настроить SUPABASE_URL, "
+            "SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_API_ID и TELEGRAM_API_HASH."
+        )
+        return result
+
+    local_path = None
+    client = None
+    try:
+        local_path = await download_internal_session(storage_path)
+        session_base = local_path.with_suffix("")
+        client = TelegramClient(
+            str(session_base),
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+        )
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            result["status"] = "unauthorized"
+            result["error"] = "Сессия не авторизована."
+            return result
+
+        me = await client.get_me()
+        result.update(
+            {
+                "status": "ok",
+                "telegram_user_id": getattr(me, "id", None),
+                "username": getattr(me, "username", None),
+                "first_name": getattr(me, "first_name", None),
+            }
+        )
+        return result
+
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)[:500]
+        return result
+
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if local_path is not None:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def save_internal_session_result(result: dict[str, Any]) -> None:
+    now = utcnow()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO internal_sessions(
+                storage_path, status, telegram_user_id, username, first_name,
+                last_error, last_checked_at, created_at, updated_at
+            )
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(storage_path) DO UPDATE SET
+                status=EXCLUDED.status,
+                telegram_user_id=EXCLUDED.telegram_user_id,
+                username=EXCLUDED.username,
+                first_name=EXCLUDED.first_name,
+                last_error=EXCLUDED.last_error,
+                last_checked_at=EXCLUDED.last_checked_at,
+                updated_at=EXCLUDED.updated_at
+            """,
+            (
+                result["storage_path"],
+                result["status"],
+                result.get("telegram_user_id"),
+                result.get("username"),
+                result.get("first_name"),
+                result.get("error"),
+                now,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+async def refresh_internal_sessions() -> list[dict[str, Any]]:
+    names = await list_internal_session_files()
+    results: list[dict[str, Any]] = []
+    for name in names:
+        result = await check_internal_session(name)
+        save_internal_session_result(result)
+        results.append(result)
+    return results
+
+
+def get_internal_session_rows():
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM internal_sessions
+            ORDER BY COALESCE(username, storage_path) ASC
+            LIMIT 100
+            """
+        ).fetchall()
+
+
+def create_internal_job(
+    user_id: int,
+    target: str,
+    target_type: str,
+    visibility: str,
+    reason: str,
+    text_mode: str,
+    prepared_text: str,
+) -> int:
+    now = utcnow()
+    with db() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO internal_jobs(
+                user_id, target, target_type, visibility, reason,
+                text_mode, prepared_text, status, created_at, updated_at
+            )
+            VALUES(%s,%s,%s,%s,%s,%s,%s,'prepared',%s,%s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                target[:1000],
+                target_type,
+                visibility,
+                reason,
+                text_mode,
+                prepared_text[:5000],
+                now,
+                now,
+            ),
+        ).fetchone()
+        conn.commit()
+    return int(row["id"])
+
+
+def get_internal_jobs(user_id: int, limit: int = 20):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM internal_jobs
+            WHERE user_id=%s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        ).fetchall()
+
+
+def normalize_internal_target(value: str) -> str | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+
+    value = value.replace("https://telegram.me/", "https://t.me/")
+    value = value.replace("http://telegram.me/", "https://t.me/")
+
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,64}", value):
+        return value
+
+    if re.fullmatch(r"[A-Za-z0-9_]{4,64}", value):
+        return "@" + value
+
+    if re.fullmatch(r"https?://t\.me/[A-Za-z0-9_+\-/]+", value, re.IGNORECASE):
+        return value.rstrip("/")
+
+    if re.fullmatch(r"t\.me/[A-Za-z0-9_+\-/]+", value, re.IGNORECASE):
+        return "https://" + value.rstrip("/")
+
+    return None
+
+
+def render_internal_template(reason: str, target: str) -> str:
+    template = INTERNAL_REASON_TEMPLATES.get(
+        reason,
+        INTERNAL_REASON_TEMPLATES["other"],
+    )
+    return template.format(target=target)
+
+
 def deactivate_promo(
     code: str,
 ):
@@ -3728,11 +4119,76 @@ def kb_menu():
             InlineKeyboardButton("📜 История", callback_data="menu:history"),
         ],
         [
+            InlineKeyboardButton("⚙️ Внутряк", callback_data="menu:internal"),
+        ],
+        [
             InlineKeyboardButton("🌐 Зеркала", callback_data="nav:mirrors"),
         ],
         [
             InlineKeyboardButton("🏠 На главную", callback_data="nav:home"),
         ],
+    ])
+
+
+def kb_internal():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Новое задание", callback_data="internal:new")],
+        [
+            InlineKeyboardButton("📁 Мои задания", callback_data="internal:jobs"),
+            InlineKeyboardButton("🔐 Сессии", callback_data="internal:sessions"),
+        ],
+        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
+    ])
+
+
+def kb_internal_target_types():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 Бот", callback_data="internal:type:bot"),
+            InlineKeyboardButton("📢 Канал", callback_data="internal:type:channel"),
+        ],
+        [InlineKeyboardButton("👥 Группа", callback_data="internal:type:group")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="internal:open")],
+    ])
+
+
+def kb_internal_visibility():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌐 Публичный", callback_data="internal:visibility:public"),
+            InlineKeyboardButton("🔒 Приватный", callback_data="internal:visibility:private"),
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="internal:open")],
+    ])
+
+
+def kb_internal_reasons():
+    items = list(MODERATION_REASONS.items())
+    rows = []
+    pair = []
+    for key, label in items:
+        pair.append(InlineKeyboardButton(label, callback_data=f"internal:reason:{key}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="internal:open")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_internal_text_mode():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Наш шаблон", callback_data="internal:text:template")],
+        [InlineKeyboardButton("✍️ Свой текст", callback_data="internal:text:custom")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="internal:open")],
+    ])
+
+
+def kb_internal_sessions():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверить сессии", callback_data="internal:sessions:refresh")],
+        [InlineKeyboardButton("⬅️ Внутряк", callback_data="internal:open")],
     ])
 
 
@@ -4367,20 +4823,11 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("captcha", None)
     set_captcha_verified(user_id)
-    granted = add_removal_credit_from_captcha(user_id)
 
     await send_ui(
         update,
         context,
-        (
-            "✅ ПРОВЕРКА ПРОЙДЕНА\n\n"
-            + (
-                "🎁 Вам доступна 1 работа."
-                if granted
-                else "ℹ️ У вас уже есть неиспользованная попытка."
-            )
-            + "\n\nТеперь можно пользоваться меню."
-        ),
+        "✅ ПРОВЕРКА ПРОЙДЕНА\n\nТеперь можно пользоваться меню.",
         kb_home(user_id),
     )
 
@@ -5183,6 +5630,136 @@ async def show_history(
             + "\n".join(lines)
         ),
         kb_menu(),
+    )
+
+
+# =========================================================
+# INTERNAL UI
+# =========================================================
+
+async def show_internal(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data["state"] = None
+    await send_ui(
+        update,
+        context,
+        (
+            "⚙️ ВНУТРЯК\n\n"
+            "Подготовка внутренних заданий Telegram.\n\n"
+            "Можно выбрать тип объекта, публичность, причину "
+            "и шаблон текста.\n\n"
+            "🔐 Сессии хранятся в приватном Supabase Storage."
+        ),
+        kb_internal(),
+    )
+
+
+async def show_internal_jobs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
+    rows = get_internal_jobs(user_id)
+    if not rows:
+        await send_ui(
+            update,
+            context,
+            "📁 МОИ ЗАДАНИЯ\n\nПока нет подготовленных заданий.",
+            kb_internal(),
+        )
+        return
+
+    lines = ["📁 МОИ ЗАДАНИЯ\n"]
+    for row in rows:
+        label = INTERNAL_TARGET_TYPES.get(row["target_type"], row["target_type"])
+        vis = INTERNAL_VISIBILITIES.get(row["visibility"], row["visibility"])
+        reason = MODERATION_REASONS.get(row["reason"], row["reason"])
+        lines.append(
+            f"#{row['id']} · {label} · {vis}\n"
+            f"🎯 {row['target']}\n"
+            f"{reason}\n"
+            f"📝 {row['text_mode']}\n"
+            f"🟡 {row['status']}\n"
+            f"{aware(row['created_at']).strftime('%d.%m.%Y %H:%M')}"
+        )
+
+    await send_ui(update, context, "\n\n".join(lines), kb_internal())
+
+
+async def show_internal_sessions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal())
+        return
+
+    if not internal_storage_ready():
+        await send_ui(
+            update,
+            context,
+            (
+                "🔐 СЕССИИ\n\n"
+                "Хранилище не настроено.\n\n"
+                "Нужны:\n"
+                "• SUPABASE_URL\n"
+                "• SUPABASE_SERVICE_ROLE_KEY\n"
+                "• TELEGRAM_API_ID\n"
+                "• TELEGRAM_API_HASH"
+            ),
+            kb_internal_sessions(),
+        )
+        return
+
+    rows = get_internal_session_rows()
+    if not rows:
+        await send_ui(
+            update,
+            context,
+            "🔐 СЕССИИ\n\nСессий пока нет. Загрузите `.session` в Supabase Storage и нажмите проверку.",
+            kb_internal_sessions(),
+        )
+        return
+
+    lines = ["🔐 СЕССИИ\n"]
+    for row in rows:
+        status_map = {
+            "ok": "🟢 Работает",
+            "unauthorized": "🔴 Не авторизована",
+            "error": "⚠️ Ошибка",
+            "not_configured": "⚪ Не настроено",
+            "unknown": "⚪ Не проверялась",
+        }
+        status = status_map.get(row["status"], row["status"])
+        account = f"@{row['username']}" if row["username"] else (row["first_name"] or row["storage_path"])
+        lines.append(f"{status} · {account}\n📄 {row['storage_path']}")
+        if row["last_error"]:
+            lines.append(f"↳ {str(row['last_error'])[:180]}")
+
+    await send_ui(update, context, "\n\n".join(lines), kb_internal_sessions())
+
+
+async def start_internal_job(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    for key in (
+        "internal_target_type",
+        "internal_visibility",
+        "internal_target",
+        "internal_reason",
+        "internal_text_mode",
+    ):
+        context.user_data.pop(key, None)
+    context.user_data["state"] = "internal_target_type"
+    await send_ui(
+        update,
+        context,
+        "⚙️ НОВОЕ ЗАДАНИЕ\n\nШаг 1/5 · выберите объект:",
+        kb_internal_target_types(),
     )
 
 
@@ -6337,6 +6914,8 @@ def create_backup_bytes() -> tuple[
         "channel_revocations",
         "moderation_cases",
         "moderation_evidence",
+        "internal_jobs",
+        "internal_sessions",
         "bot_admins",
         "bot_mirrors",
     ]
@@ -7962,6 +8541,16 @@ async def nav_callback(
             context,
         )
 
+    elif data == "menu:internal":
+
+        if not await require_subscription(update, context, user_id):
+            return
+
+        await show_internal(
+            update,
+            context,
+        )
+
     elif data == "menu:history":
 
         await show_history(
@@ -8214,6 +8803,146 @@ async def broadcast_text(
         sent,
         failed,
     )
+
+
+# =========================================================
+# INTERNAL CALLBACK
+# =========================================================
+
+async def internal_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    q = update.callback_query
+    user_id = q.from_user.id
+    data = q.data or ""
+    ensure_profile(user_id, q.from_user)
+
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+
+    if data == "internal:open":
+        if not await require_subscription(update, context, user_id):
+            return
+        await show_internal(update, context)
+        return
+
+    if data == "internal:new":
+        if not await require_subscription(update, context, user_id):
+            return
+        context.user_data["internal_target_type"] = None
+        context.user_data["internal_visibility"] = None
+        context.user_data["internal_target"] = None
+        context.user_data["internal_reason"] = None
+        context.user_data["internal_text_mode"] = None
+        context.user_data["state"] = "internal_target_type"
+        await send_ui(update, context, "⚙️ НОВОЕ ЗАДАНИЕ\n\nШаг 1/5 · выберите объект:", kb_internal_target_types())
+        return
+
+    if data.startswith("internal:type:"):
+        target_type = data.rsplit(":", 1)[1]
+        if target_type not in INTERNAL_TARGET_TYPES:
+            return
+        context.user_data["internal_target_type"] = target_type
+        context.user_data["state"] = "internal_visibility"
+        await send_ui(
+            update, context,
+            f"{INTERNAL_TARGET_TYPES[target_type]}\n\nШаг 2/5 · выберите тип доступа:",
+            kb_internal_visibility(),
+        )
+        return
+
+    if data.startswith("internal:visibility:"):
+        visibility = data.rsplit(":", 1)[1]
+        if visibility not in INTERNAL_VISIBILITIES:
+            return
+        context.user_data["internal_visibility"] = visibility
+        context.user_data["state"] = "internal_target"
+        await send_ui(
+            update, context,
+            f"{INTERNAL_VISIBILITIES[visibility]}\n\nШаг 3/5 · пришлите @username или ссылку t.me:",
+            kb_internal(),
+        )
+        return
+
+    if data.startswith("internal:reason:"):
+        reason = data.rsplit(":", 1)[1]
+        if reason not in MODERATION_REASONS:
+            return
+        context.user_data["internal_reason"] = reason
+        context.user_data["state"] = "internal_text_mode"
+        await send_ui(
+            update, context,
+            f"📄 Шаг 4/5 · причина\n{MODERATION_REASONS[reason]}\n\nВыберите текст:",
+            kb_internal_text_mode(),
+        )
+        return
+
+    if data == "internal:text:template":
+        target = context.user_data.get("internal_target")
+        reason = context.user_data.get("internal_reason")
+        target_type = context.user_data.get("internal_target_type")
+        visibility = context.user_data.get("internal_visibility")
+        if not all([target, reason, target_type, visibility]):
+            await send_ui(update, context, "❌ Данные задания устарели.", kb_internal())
+            return
+        prepared = render_internal_template(reason, target)
+        job_id = create_internal_job(
+            user_id, target, target_type, visibility, reason, "Наш шаблон", prepared
+        )
+        for key in (
+            "internal_target_type",
+            "internal_visibility",
+            "internal_target",
+            "internal_reason",
+            "internal_text_mode",
+        ):
+            context.user_data.pop(key, None)
+        context.user_data["state"] = None
+        await send_ui(
+            update, context,
+            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\nАвтоматической массовой отправки жалоб из нескольких аккаунтов этот модуль не выполняет.",
+            kb_internal(),
+        )
+        return
+
+    if data == "internal:text:custom":
+        context.user_data["internal_text_mode"] = "custom"
+        context.user_data["state"] = "internal_custom_text"
+        await send_ui(
+            update, context,
+            "✍️ Шаг 5/5 · пришлите свой текст обращения:",
+            kb_internal(),
+        )
+        return
+
+    if data == "internal:jobs":
+        await show_internal_jobs(update, context)
+        return
+
+    if data == "internal:sessions":
+        await show_internal_sessions(update, context)
+        return
+
+    if data == "internal:sessions:refresh":
+        if not is_admin(user_id):
+            await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal())
+            return
+        if not internal_storage_ready():
+            await show_internal_sessions(update, context)
+            return
+        await send_ui(update, context, "⏳ Проверяю сессии...", kb_internal_sessions())
+        results = await refresh_internal_sessions()
+        ok = sum(r["status"] == "ok" for r in results)
+        bad = len(results) - ok
+        await send_ui(
+            update, context,
+            f"✅ Проверка завершена.\n\n🟢 Рабочих: {ok}\n⚠️ Остальных: {bad}",
+            kb_internal_sessions(),
+        )
+        return
 
 
 # =========================================================
@@ -9087,6 +9816,48 @@ async def handle_text(
     state = context.user_data.get(
         "state"
     )
+
+    # ---------------------------------------------
+    # INTERNAL JOBS
+    # ---------------------------------------------
+
+    if state == "internal_target":
+        normalized = normalize_internal_target(text)
+        if not normalized:
+            await update.message.reply_text(
+                "❌ Неверная ссылка. Используйте @username или ссылку t.me/...",
+                reply_markup=kb_internal(),
+            )
+            return
+
+        context.user_data["internal_target"] = normalized
+        context.user_data["state"] = "internal_reason"
+        await update.message.reply_text(
+            "✅ Объект принят.\n\nШаг 4/5 · выберите причину:",
+            reply_markup=kb_internal_reasons(),
+        )
+        return
+
+    if state == "internal_custom_text":
+        target = context.user_data.get("internal_target")
+        reason = context.user_data.get("internal_reason")
+        target_type = context.user_data.get("internal_target_type")
+        visibility = context.user_data.get("internal_visibility")
+        if not all([target, reason, target_type, visibility]):
+            context.user_data.clear()
+            await update.message.reply_text("❌ Данные задания устарели.", reply_markup=kb_internal())
+            return
+
+        prepared = text[:5000]
+        job_id = create_internal_job(
+            user_id, target, target_type, visibility, reason, "Свой текст", prepared
+        )
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\nАвтоматической массовой отправки жалоб из нескольких аккаунтов этот модуль не выполняет.",
+            reply_markup=kb_internal(),
+        )
+        return
 
     # ---------------------------------------------
     # ADMIN USER SEARCH

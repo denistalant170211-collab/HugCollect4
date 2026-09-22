@@ -1,15 +1,33 @@
 services:
   - type: web
-    name: hugcollect-bot
+    name: hugcollect4
     runtime: python
     plan: free
-    rootDir: HugCollectBot
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.3
       - key: BOT_TOKEN
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: MIRROR_ENCRYPTION_KEY
+        sync: false
       - key: SUPPORT_USERNAME
-        value: "@your_support_username"
-      - key: PYTHON_VERSION
-        value: "3.13.5"
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_SESSIONS_BUCKET
+        value: internal-sessions
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: INTERNAL_SESSION_CACHE_DIR
+        value: /tmp/darkcollect_sessions
