@@ -331,6 +331,7 @@ ASSETS_DIR = next(
 
 PROFILE_BANNER = ASSETS_DIR / "profile_banner.png"
 MENU_BANNER = ASSETS_DIR / "menu_banner.png"
+WELCOME_BANNER = ASSETS_DIR / "darkcollect_banner.png"
 
 
 # =========================================================
@@ -560,6 +561,7 @@ def add_removal_credit_from_captcha(user_id: int) -> bool:
 
 
 def consume_removal_credit(user_id: int) -> bool:
+    """Consume the available work credit without resetting captcha verification."""
     with db() as conn:
         row = conn.execute(
             "SELECT removal_credits FROM profiles WHERE user_id=%s FOR UPDATE",
@@ -571,8 +573,7 @@ def consume_removal_credit(user_id: int) -> bool:
         conn.execute(
             """
             UPDATE profiles
-            SET removal_credits=removal_credits-1,
-                captcha_verified_at=NULL
+            SET removal_credits=removal_credits-1
             WHERE user_id=%s
             """,
             (user_id,),
@@ -582,18 +583,17 @@ def consume_removal_credit(user_id: int) -> bool:
 
 
 def captcha_is_valid(user_id: int) -> bool:
+    """Return True after the user has passed the captcha once.
+
+    The verification is persistent in PostgreSQL and does not expire.
+    This means each Telegram user solves the captcha only once.
+    """
     with db() as conn:
         row = conn.execute(
             "SELECT captcha_verified_at FROM profiles WHERE user_id=%s",
             (user_id,),
         ).fetchone()
-    if not row or not row["captcha_verified_at"]:
-        return False
-    verified_at = aware(row["captcha_verified_at"])
-    return bool(
-        verified_at
-        and verified_at + timedelta(seconds=CAPTCHA_TTL_SECONDS) > utcnow()
-    )
+    return bool(row and row["captcha_verified_at"])
 
 
 def set_captcha_verified(user_id: int) -> None:
@@ -1085,7 +1085,7 @@ async def show_captcha(
         "Подтвердите, что вы человек.\n"
         "Решите пример:\n\n"
         f"🧩 {a} + {b} = ?\n\n"
-        "После успешной проверки будет доступна одна попытка Cn1сtи."
+        "После успешной проверки будет доступна работа."
     )
     if alert_text:
         text = f"{alert_text}\n\n{text}"
@@ -3954,7 +3954,7 @@ def kb_confirm_hug():
         [
             [
                 InlineKeyboardButton(
-                    "💥 Cn1сtи аккаунт!",
+                    "🚀 Начать работу",
                     callback_data="hug:yes",
                 )
             ],
@@ -4375,7 +4375,7 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (
             "✅ ПРОВЕРКА ПРОЙДЕНА\n\n"
             + (
-                "🎁 Вам начислена 1 попытка Cn1сtи."
+                "🎁 Вам доступна 1 работа."
                 if granted
                 else "ℹ️ У вас уже есть неиспользованная попытка."
             )
@@ -4520,16 +4520,12 @@ async def channel_gate(
         raise ApplicationHandlerStop
 
     if user_rate_limited(user.id):
-        invalidate_captcha(user.id)
-        await show_captcha(
+        await send_ui(
             update,
             context,
-            "⚠️ Слишком много действий. Пройдите проверку снова.",
+            "⚠️ Слишком много действий. Подождите немного.",
+            kb_home(user.id),
         )
-        raise ApplicationHandlerStop
-
-    if not captcha_is_valid(user.id):
-        await show_captcha(update, context)
         raise ApplicationHandlerStop
 
     if not REQUIRED_CHANNEL_ID:
@@ -4594,6 +4590,7 @@ async def send_ui(
     markup: InlineKeyboardMarkup | None = None,
     photo: Path | None = None,
     replace: bool = True,
+    caption_above_media: bool | None = None,
 ):
 
     chat_id = (
@@ -4622,13 +4619,15 @@ async def send_ui(
 
                 try:
 
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=fh,
-                        caption=text,
-                        reply_markup=markup,
-                        show_caption_above_media=True,
-                    )
+                    photo_kwargs = {
+                        "chat_id": chat_id,
+                        "photo": fh,
+                        "caption": text,
+                        "reply_markup": markup,
+                    }
+                    if caption_above_media is not None:
+                        photo_kwargs["show_caption_above_media"] = caption_above_media
+                    await context.bot.send_photo(**photo_kwargs)
 
                 except TypeError:
 
@@ -4668,6 +4667,8 @@ async def show_home(
         context,
         GREETING,
         kb_home(user_id),
+        photo=WELCOME_BANNER,
+        caption_above_media=False,
     )
 
 
@@ -4707,7 +4708,8 @@ async def show_menu(
         context,
         "Выберите действие 👇",
         kb_menu(),
-        photo=MENU_BANNER,
+        photo=WELCOME_BANNER,
+        caption_above_media=False,
     )
 
 
@@ -4819,7 +4821,7 @@ def profile_caption(
         "👤 Личный кабинет\n\n"
         f"🤗 Уровень — {profile['level']}\n"
         f"💞 Приоритет — {profile['warmth']}/1000\n"
-        f"💬 Отправлено жалоб — {profile['sent']}\n"
+        f"💬 Выполнено работ — {profile['sent']}\n"
         f"👀 Всего поисков — {profile['searches']}\n\n"
         f"💎 Подписка — {sub_text}"
         f"{expires_text}"
@@ -4827,7 +4829,7 @@ def profile_caption(
         f"📊 Запросов сегодня — "
         f"{usage_today(user_id)}/"
         f"{DAILY_REQUEST_LIMIT}\n"
-        f"💥 Попыток сноса доступно — {get_user_removal_credits(user_id)}"
+        f"🚀 Работ доступно — {get_user_removal_credits(user_id)}"
     )
 
 
@@ -4897,8 +4899,8 @@ async def run_hug_animation(
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⭕️Отправлено жалоб — {count}⭕️\n\n"
-                f"✅ Попытка Cn1сtи {type_label} завершена.\n\n"
+                "✅ Работа завершена.\n\n"
+                "⏳ Ждём результата.\n\n"
                 "Ура! 🎉"
             ),
             reply_markup=kb_hooray(),
@@ -4937,18 +4939,14 @@ async def start_hug(
     if not await require_subscription(update, context, user_id):
         return
 
-    if not captcha_is_valid(user_id):
-        await show_captcha(update, context)
-        return
-
     if get_user_removal_credits(user_id) <= 0:
         await send_ui(
             update,
             context,
             (
-                "💥 CN1СTИ АККАУНТ\n\n"
+                "🚀 НАЧАТЬ РАБОТУ\n\n"
                 "Доступных попыток нет.\n\n"
-                "Пройдите капчу, чтобы получить одну попытку сноса."
+                "После проверки вам будет доступна работа."
             ),
             kb_home(user_id),
         )
@@ -4961,7 +4959,7 @@ async def start_hug(
         update,
         context,
         (
-            "💥 CN1СTИ АККАУНТ\n\n"
+            "🚀 НАЧАТЬ РАБОТУ\n\n"
             "Выберите тип объекта:\n\n"
             "👤 Аккаунт\n"
             "👥 Группа\n"
@@ -4981,17 +4979,12 @@ async def confirm_and_send_hug(
         context.user_data["state"] = None
         return
 
-    if not captcha_is_valid(user_id):
-        context.user_data["state"] = None
-        await show_captcha(update, context)
-        return
-
     target = context.user_data.get("hug_target", "объект")
     target_type = context.user_data.get("hug_target_type", "user")
 
     if get_user_removal_credits(user_id) <= 0:
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Доступная попытка сноса уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Доступная работа уже использована.", kb_home(user_id))
         return
 
     ok, _used = request_usage(user_id)
@@ -5007,7 +5000,7 @@ async def confirm_and_send_hug(
 
     if not consume_removal_credit(user_id):
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Попытка Cn1сtи уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Работа уже запущена.", kb_home(user_id))
         return
 
     context.user_data["state"] = None
@@ -5552,7 +5545,7 @@ def admin_user_details(
         f"🪙 {CRYPTO_ASSET}: "
         f"{float(crypto_sum or 0):g}\n\n"
         f"💬 Сессий sn1c: {hugs['total']}\n"
-        f"⭕️ Всего жалоб: "
+        f"✅ Всего работ: "
         f"{int(hugs['sent'] or 0)}\n"
         f"🔎 Поисков: {searches}\n"
         f"👥 Рефералов: {referrals}\n"
