@@ -91,6 +91,11 @@ WEBHOOK_BASE = (
     or ""
 ).strip()
 
+PRIMARY_BOT_URL = os.environ.get(
+    "PRIMARY_BOT_URL",
+    "https://t.me/darkcollecttbot",
+).strip()
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
@@ -678,6 +683,20 @@ def get_all_mirrors():
     with db() as conn:
         return conn.execute(
             "SELECT * FROM bot_mirrors ORDER BY id ASC"
+        ).fetchall()
+
+
+def get_user_active_mirrors(user_id: int):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM bot_mirrors
+            WHERE active=TRUE
+              AND owner_id=%s
+            ORDER BY id ASC
+            """,
+            (user_id,),
         ).fetchall()
 
 
@@ -4191,8 +4210,10 @@ def kb_admin_promo_list(
 # =========================================================
 
 async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_all_mirrors()
-    primary = WEBHOOK_BASE or "https://hugcollect4.onrender.com"
+    user_id = update.effective_user.id
+    rows = get_user_active_mirrors(user_id)
+    primary = PRIMARY_BOT_URL
+
     lines = [
         "🌐 ДОСТУП К ПРОЕКТУ",
         "",
@@ -4201,49 +4222,40 @@ async def show_mirrors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
     ]
 
-    active_found = False
-    for row in rows:
-        if not row["active"]:
-            continue
-        active_found = True
-        status_text = (
-            "🔵 Добавлено пользователем"
-            if row.get("owner_id")
-            else format_mirror_status(row)
-        )
-        lines.extend([
-            status_text,
-            f"• {row['name']}",
-            row["url"],
-            "",
-        ])
-
-    if not active_found:
-        lines.append("Резервные адреса пока не добавлены.")
+    if rows:
+        lines.append("🔵 МОИ ЗЕРКАЛА:")
+        for row in rows:
+            lines.extend([
+                f"• {row['name']}",
+                row["url"],
+                format_mirror_status(row),
+                "",
+            ])
+    else:
+        lines.append("У вас пока нет подключённых зеркал.")
 
     lines.extend([
         "",
-        "ℹ️ Можно подключить собственное зеркало через токен @BotFather.",
-        "🔐 Токен шифруется перед сохранением.",
+        "ℹ️ Зеркала, подключённые другими пользователями, вам не показываются.",
+        "🔐 Добавить своё зеркало можно через токен @BotFather.",
     ])
 
     await send_ui(
         update,
         context,
         "\n".join(lines),
-        kb_mirrors(update.effective_user.id),
+        kb_mirrors(user_id),
     )
 
-
 async def show_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_active_mirrors()
+    user_id = update.effective_user.id
+    rows = get_user_active_mirrors(user_id)
     text = MAINTENANCE_TEXT
     if rows:
-        text += "\n\n🌐 Резервные адреса:\n"
+        text += "\n\n🌐 Ваши зеркала:\n"
         for row in rows[:8]:
             text += f"• {row['name']} — {row['url']}\n"
     await send_ui(update, context, text, None)
-
 
 async def show_admin_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_ui(
