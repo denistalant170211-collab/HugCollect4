@@ -894,7 +894,7 @@ def build_bot_application(token: str) -> Application:
 def schedule_mirror(application: Application, mirror_id: int) -> None:
     if mirror_id in MIRROR_TASKS and not MIRROR_TASKS[mirror_id].done():
         return
-    task = application.create_task(
+    task = asyncio.create_task(
         mirror_bot_runner(mirror_id),
         name=f"mirror-bot-{mirror_id}",
     )
@@ -10297,28 +10297,32 @@ async def post_init(
     application: Application,
 ):
 
-    application.create_task(
+    asyncio.create_task(
         expiration_loop(
             application
-        )
+        ),
+        name="expiration-loop",
     )
 
-    application.create_task(
+    asyncio.create_task(
         cleanup_loop(
             application
-        )
+        ),
+        name="cleanup-loop",
     )
 
-    application.create_task(
+    asyncio.create_task(
         auto_backup_loop(
             application
-        )
+        ),
+        name="auto-backup-loop",
     )
 
-    application.create_task(
+    asyncio.create_task(
         mirror_monitor_loop(
             application
-        )
+        ),
+        name="mirror-monitor-loop",
     )
 
     # Start all active BotFather-based mirrors after the main bot is ready.
