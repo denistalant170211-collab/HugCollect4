@@ -52,7 +52,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("hugbot")
+logger = logging.getLogger("darkbot")
 
 
 # =========================================================
@@ -288,7 +288,7 @@ PLANS = {
 # =========================================================
 
 GREETING = (
-    "🤖 HUGCOLLECT\n\n"
+    "🤖 DARKCOLLECT\n\n"
     "Добро пожаловать!\n"
     "Выберите нужный раздел ниже 👇"
 )
@@ -766,49 +766,79 @@ async def add_mirror_bot(
 
     try:
         with db() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO bot_mirrors(
-                    name,
-                    url,
-                    owner_id,
-                    active,
-                    bot_token_enc,
-                    bot_username,
-                    token_fingerprint,
-                    last_status,
-                    last_checked_at,
-                    created_at
-                )
-                VALUES(%s,%s,%s,TRUE,%s,%s,%s,200,%s,%s)
-                ON CONFLICT(token_fingerprint)
-                DO UPDATE SET
-                    name=EXCLUDED.name,
-                    url=EXCLUDED.url,
-                    owner_id=EXCLUDED.owner_id,
-                    active=TRUE,
-                    bot_token_enc=EXCLUDED.bot_token_enc,
-                    bot_username=EXCLUDED.bot_username,
-                    last_status=200,
-                    last_checked_at=EXCLUDED.last_checked_at
-                RETURNING id
-                """,
-                (
-                    mirror_name,
-                    url,
-                    owner_id,
-                    encrypted,
-                    username,
-                    fingerprint,
-                    utcnow(),
-                    utcnow(),
-                ),
+            # The token fingerprint index is a partial unique index, so
+            # PostgreSQL cannot use ON CONFLICT(token_fingerprint) inference
+            # without the matching predicate. Use an explicit lookup/update
+            # path instead; this fixes mirror creation on existing databases.
+            existing = conn.execute(
+                "SELECT id FROM bot_mirrors WHERE token_fingerprint=%s LIMIT 1",
+                (fingerprint,),
             ).fetchone()
+
+            if existing:
+                row = conn.execute(
+                    """
+                    UPDATE bot_mirrors
+                    SET name=%s,
+                        url=%s,
+                        owner_id=%s,
+                        active=TRUE,
+                        bot_token_enc=%s,
+                        bot_username=%s,
+                        last_status=200,
+                        last_checked_at=%s
+                    WHERE id=%s
+                    RETURNING id
+                    """,
+                    (
+                        mirror_name,
+                        url,
+                        owner_id,
+                        encrypted,
+                        username,
+                        utcnow(),
+                        existing["id"],
+                    ),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    INSERT INTO bot_mirrors(
+                        name,
+                        url,
+                        owner_id,
+                        active,
+                        bot_token_enc,
+                        bot_username,
+                        token_fingerprint,
+                        last_status,
+                        last_checked_at,
+                        created_at
+                    )
+                    VALUES(%s,%s,%s,TRUE,%s,%s,%s,200,%s,%s)
+                    RETURNING id
+                    """,
+                    (
+                        mirror_name,
+                        url,
+                        owner_id,
+                        encrypted,
+                        username,
+                        fingerprint,
+                        utcnow(),
+                        utcnow(),
+                    ),
+                ).fetchone()
+
             conn.commit()
     except psycopg_errors.UniqueViolation as exc:
         raise ValueError(
             "Этот username уже занят другим зеркалом. Удали старое зеркало перед повторным добавлением."
         ) from exc
+
+    except Exception as exc:
+        logger.exception("Mirror database save failed: username=%s", username)
+        raise ValueError(f"Не удалось сохранить зеркало в базе: {exc}") from exc
 
     if not row:
         raise ValueError("Не удалось сохранить зеркало.")
@@ -1036,7 +1066,7 @@ async def show_captcha(
         "Подтвердите, что вы человек.\n"
         "Решите пример:\n\n"
         f"🧩 {a} + {b} = ?\n\n"
-        "После успешной проверки будет доступна одна попытка сноса."
+        "После успешной проверки будет доступна одна попытка Cn1сtи."
     )
     if alert_text:
         text = f"{alert_text}\n\n{text}"
@@ -3905,7 +3935,7 @@ def kb_confirm_hug():
         [
             [
                 InlineKeyboardButton(
-                    "💥 Да, снести аккаунт!",
+                    "💥 Cn1сtи аккаунт!",
                     callback_data="hug:yes",
                 )
             ],
@@ -4333,7 +4363,7 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (
             "✅ ПРОВЕРКА ПРОЙДЕНА\n\n"
             + (
-                "🎁 Вам начислена 1 попытка сноса."
+                "🎁 Вам начислена 1 попытка Cn1сtи."
                 if granted
                 else "ℹ️ У вас уже есть неиспользованная попытка."
             )
@@ -4858,7 +4888,7 @@ async def start_hug(
             update,
             context,
             (
-                "💥 СНЕСТИ АККАУНТ\n\n"
+                "💥 CN1СTИ АККАУНТ\n\n"
                 "Доступных попыток нет.\n\n"
                 "Пройдите капчу, чтобы получить одну попытку сноса."
             ),
@@ -4873,7 +4903,7 @@ async def start_hug(
         update,
         context,
         (
-            "💥 СНЕСТИ АККАУНТ\n\n"
+            "💥 CN1СTИ АККАУНТ\n\n"
             "Выберите тип объекта:\n\n"
             "👤 Аккаунт\n"
             "👥 Группа\n"
@@ -4919,7 +4949,7 @@ async def confirm_and_send_hug(
 
     if not consume_removal_credit(user_id):
         context.user_data["state"] = None
-        await send_ui(update, context, "❌ Попытка сноса уже использована.", kb_home(user_id))
+        await send_ui(update, context, "❌ Попытка Cn1сtи уже использована.", kb_home(user_id))
         return
 
     context.user_data["state"] = None
@@ -6263,7 +6293,7 @@ def create_backup_bytes() -> tuple[
     payload = {
         "format": 1,
         "generated_at": utcnow().isoformat(),
-        "project": "HugCollectBot",
+        "project": "DarkCollect",
         "tables": {},
     }
 
@@ -7911,7 +7941,7 @@ async def nav_callback(
             update,
             context,
             (
-                f"💥 СНЕСТИ {label.upper()}\n\n"
+                f"💥 CN1СTИ {label.upper()}\n\n"
                 "Введите @username, публичную ссылку или другой "
                 "идентификатор объекта.\n\n"
                 ""
