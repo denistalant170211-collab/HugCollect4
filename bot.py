@@ -4843,9 +4843,21 @@ async def run_hug_animation(
     target: str,
     target_type: str = "user",
 ):
+    """Run the progress animation and always send the completion message.
+
+    The previous version referenced ``type_label`` before defining it, so the
+    coroutine raised NameError immediately after 100%, leaving the user stuck
+    on the 100% step.
+    """
+    type_label = HUG_TARGET_TYPES.get(
+        target_type,
+        "👤 аккаунта",
+    )
+    count = 356
+
     try:
         await asyncio.sleep(1)
-        for percent in [12, 25, 41, 58, 73, 89]:
+        for percent in [8, 20, 34, 49, 68, 71, 90]:
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"💤{percent}%💤",
@@ -4858,29 +4870,63 @@ async def run_hug_animation(
         )
         await asyncio.sleep(0.5)
 
-        add_hug(user_id, target, 1, target_type=target_type)
-        log_event(
-            "INFO",
-            "processing_attempt",
-            user_id,
-            {"target": target, "target_type": target_type},
-        )
+        # Logging/history should not be able to break the user-facing finish.
+        try:
+            add_hug(
+                user_id,
+                target,
+                1,
+                target_type=target_type,
+            )
+        except Exception:
+            logger.exception("Could not save removal attempt")
+
+        try:
+            log_event(
+                "INFO",
+                "processing_attempt",
+                user_id,
+                {
+                    "target": target,
+                    "target_type": target_type,
+                },
+            )
+        except Exception:
+            logger.exception("Could not log processing attempt")
 
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"✅ Попытка сноса {type_label} завершена."
+                f"⭕️Отправлено жалоб — {count}⭕️\n\n"
+                f"✅ Попытка Cn1сtи {type_label} завершена.\n\n"
+                "Ура! 🎉"
             ),
             reply_markup=kb_hooray(),
         )
-    except Exception:
-        logger.exception("Hug animation failed")
-        log_event(
-            "ERROR",
-            "hug_animation_failed",
+    except asyncio.CancelledError:
+        logger.warning(
+            "Hug animation cancelled: chat_id=%s user_id=%s target=%s",
+            chat_id,
             user_id,
-            {"target": target, "target_type": target_type},
+            target,
         )
+        raise
+    except Exception:
+        logger.exception(
+            "Hug animation failed: chat_id=%s user_id=%s target=%s type=%s",
+            chat_id,
+            user_id,
+            target,
+            target_type,
+        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ Произошла ошибка при завершении попытки.",
+                reply_markup=kb_hooray(),
+            )
+        except Exception:
+            logger.exception("Could not send hug animation error message")
 
 
 async def start_hug(
