@@ -251,7 +251,7 @@ REPORTS_PER_ACCOUNT = max(
 )
 INTERNAL_MAX_PARALLEL = max(
     1,
-    min(10, int(os.environ.get("INTERNAL_MAX_PARALLEL", "3"))),
+    min(10, int(os.environ.get("INTERNAL_MAX_PARALLEL", "5"))),
 )
 
 INTERNAL_REPORT_REASONS: dict[str, tuple[Any, str]] = {
@@ -1368,7 +1368,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("user", cmd_user))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|menu:|hug:)"))
-    app.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     app.add_handler(CallbackQueryHandler(internal_callback, pattern=r"^internal:"))
     app.add_handler(CallbackQueryHandler(subscription_callback, pattern=r"^(sub:|pay:|manual_crypto:|check_crypto:)"))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
@@ -4310,15 +4309,7 @@ def kb_profile():
 def kb_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💥 Снести аккаунт", callback_data="menu:hug"),
-        ],
-        [
-            InlineKeyboardButton("👀 Поиск", callback_data="menu:search"),
             InlineKeyboardButton("🔎 Проверка", callback_data="menu:check"),
-        ],
-        [
-            InlineKeyboardButton("🛡 Модерация", callback_data="menu:moderation"),
-            InlineKeyboardButton("📜 История", callback_data="menu:history"),
         ],
         [
             InlineKeyboardButton("⚙️ Внутряк", callback_data="menu:internal"),
@@ -4592,52 +4583,10 @@ HUG_TARGET_TYPES = {
 }
 
 
-def kb_hug_target_type():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👤 Аккаунт", callback_data="hug:type:user"),
-            InlineKeyboardButton("👥 Группа", callback_data="hug:type:group"),
-        ],
-        [
-            InlineKeyboardButton("📢 Канал", callback_data="hug:type:channel"),
-            InlineKeyboardButton("🤖 Бот", callback_data="hug:type:bot"),
-        ],
-        [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
-    ])
 
 
-def kb_confirm_hug():
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🚀 Начать работу",
-                    callback_data="hug:yes",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Нет, отмена",
-                    callback_data="hug:no",
-                )
-            ],
-        ]
-    )
 
 
-def kb_hooray():
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Ура! 🎉",
-                    callback_data="nav:home",
-                )
-            ]
-        ]
-    )
 
 
 def kb_sub_plans():
@@ -5427,243 +5376,10 @@ def profile_caption(
 # HUG PROCESS
 # =========================================================
 
-async def run_hug_animation(
-    bot,
-    chat_id: int,
-    message_id: int,
-    user_id: int,
-    target: str,
-    target_type: str = "user",
-):
-    """Real work: report the target from Supabase sessions with live progress.
-
-    Progress percents are driven by actual per-account completion, and the
-    finish message carries the real sent count.
-    """
-    type_label = HUG_TARGET_TYPES.get(
-        target_type,
-        "👤 аккаунта",
-    )
-    milestones = [8, 20, 34, 49, 68, 71, 90]
-    milestone_idx = [0]
-
-    async def on_progress(done: int, total: int):
-        frac = done / max(total, 1)
-        while (
-            milestone_idx[0] < len(milestones)
-            and frac >= milestones[milestone_idx[0]] / 100
-        ):
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"💤{milestones[milestone_idx[0]]}%💤",
-                )
-            except Exception:
-                pass
-            milestone_idx[0] += 1
-
-    try:
-        sent = 0
-        used = 0
-        errors: list[str] = []
-        if internal_storage_ready():
-            await asyncio.sleep(1)
-            sent, used, errors = await run_internal_reports(
-                target,
-                INTERNAL_DEFAULT_REASON,
-                REPORTS_PER_ACCOUNT,
-                render_internal_template(INTERNAL_DEFAULT_REASON, target),
-                progress_cb=on_progress,
-            )
-        else:
-            logger.warning("hug without sessions: storage not configured")
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text="💤100%💤",
-        )
-        await asyncio.sleep(0.5)
-
-        # Logging/history should not be able to break the user-facing finish.
-        try:
-            add_hug(
-                user_id,
-                target,
-                sent,
-                target_type=target_type,
-            )
-        except Exception:
-            logger.exception("Could not save removal attempt")
-
-        try:
-            log_event(
-                "INFO",
-                "processing_attempt",
-                user_id,
-                {
-                    "target": target,
-                    "target_type": target_type,
-                    "sent": sent,
-                    "accounts_used": used,
-                },
-            )
-        except Exception:
-            logger.exception("Could not log processing attempt")
-
-        if sent > 0:
-            finish_text = (
-                "✅ Работа завершена.\n\n"
-                f"📤 Отправлено — {sent}\n\n"
-                "⏳ Ждём результата.\n\n"
-                "Ура! 🎉"
-            )
-        elif errors == ["no_sessions"] or errors == ["storage_not_configured"]:
-            finish_text = (
-                "⚠️ Работа не запущена: нет рабочих сессий.\n\n"
-                "Администратор должен загрузить .session в хранилище."
-            )
-        else:
-            finish_text = (
-                "❌ Работа не дала отправок.\n\n"
-                "Попробуйте позже."
-            )
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text=finish_text,
-            reply_markup=kb_hooray(),
-        )
-    except asyncio.CancelledError:
-        logger.warning(
-            "Hug animation cancelled: chat_id=%s user_id=%s target=%s",
-            chat_id,
-            user_id,
-            target,
-        )
-        raise
-    except Exception:
-        logger.exception(
-            "Hug animation failed: chat_id=%s user_id=%s target=%s type=%s",
-            chat_id,
-            user_id,
-            target,
-            target_type,
-        )
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="❌ Произошла ошибка при завершении попытки.",
-                reply_markup=kb_hooray(),
-            )
-        except Exception:
-            logger.exception("Could not send hug animation error message")
 
 
-async def start_hug(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-):
-    if not await require_subscription(update, context, user_id):
-        return
-
-    if get_user_remaining_requests(user_id) <= 0:
-        await send_ui(
-            update,
-            context,
-            (
-                "🚀 НАЧАТЬ РАБОТУ\n\n"
-                "Лимит запросов на сегодня исчерпан.\n\n"
-                f"Доступно: {DAILY_REQUEST_LIMIT} запросов в день."
-            ),
-            kb_home(user_id),
-        )
-        return
-
-    context.user_data["state"] = "awaiting_hug_type"
-    context.user_data.pop("hug_target_type", None)
-
-    await send_ui(
-        update,
-        context,
-        (
-            "🚀 НАЧАТЬ РАБОТУ\n\n"
-            "Выберите тип объекта:\n\n"
-            "👤 Аккаунт\n"
-            "👥 Группа\n"
-            "📢 Канал\n"
-            "🤖 Бот\n"
-        ),
-        kb_hug_target_type(),
-    )
 
 
-async def confirm_and_send_hug(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-):
-    if not await require_subscription(update, context, user_id):
-        context.user_data["state"] = None
-        return
-
-    target = context.user_data.get("hug_target", "объект")
-    target_type = context.user_data.get("hug_target_type", "user")
-
-    if get_user_remaining_requests(user_id) <= 0:
-        context.user_data["state"] = None
-        await send_ui(update, context, "❌ Лимит запросов на сегодня исчерпан.", kb_home(user_id))
-        return
-
-    ok, _used = request_usage(user_id)
-    if not ok:
-        context.user_data["state"] = None
-        await send_ui(
-            update,
-            context,
-            f"⛔️ Лимит на сегодня исчерпан.\n\nДоступно {DAILY_REQUEST_LIMIT} запросов в день.",
-            kb_menu(),
-        )
-        return
-
-    context.user_data["state"] = None
-    context.user_data.pop("hug_target", None)
-    context.user_data.pop("hug_target_type", None)
-
-    initial_text = (
-        "💤 Идёт обработка 💤\n\n"
-        "3%\n\n"
-        "🔰 Выполняется одна попытка 🔰"
-    )
-
-    chat_id = update.effective_chat.id
-    q = update.callback_query
-
-    if q and q.message:
-        try:
-            await q.message.edit_text(initial_text)
-            msg_id = q.message.message_id
-        except BadRequest:
-            msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
-            msg_id = msg.message_id
-    elif update.message:
-        msg = await update.message.reply_text(initial_text)
-        msg_id = msg.message_id
-    else:
-        msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
-        msg_id = msg.message_id
-
-    context.application.create_task(
-        run_hug_animation(
-            context.bot,
-            chat_id,
-            msg_id,
-            user_id,
-            target,
-            target_type,
-        ),
-        update=update,
-    )
 
 
 # =========================================================
@@ -8688,35 +8404,12 @@ async def nav_callback(
             context,
         )
 
-    elif data == "menu:hug":
-
-        await start_hug(
-            update,
-            context,
-            user_id,
-        )
-
-    elif data == "menu:search":
-
-        await do_search(
-            update,
-            context,
-            user_id,
-        )
-
     elif data == "menu:check":
 
         await start_check(
             update,
             context,
             user_id,
-        )
-
-    elif data == "menu:moderation":
-
-        await show_moderation(
-            update,
-            context,
         )
 
     elif data == "menu:internal":
@@ -8727,84 +8420,6 @@ async def nav_callback(
         await show_internal(
             update,
             context,
-        )
-
-    elif data == "menu:history":
-
-        await show_history(
-            update,
-            context,
-            user_id,
-        )
-
-    elif data.startswith("hug:type:"):
-
-        target_type = data.split(":", 2)[2]
-
-        if target_type not in HUG_TARGET_TYPES:
-            await send_ui(
-                update,
-                context,
-                "❌ Неизвестный тип объекта.",
-                kb_hug_target_type(),
-            )
-            return
-
-        context.user_data["hug_target_type"] = target_type
-        context.user_data["state"] = "awaiting_hug_target"
-
-        label = HUG_TARGET_TYPES[target_type]
-
-        await send_ui(
-            update,
-            context,
-            (
-                f"💥 CN1СTИ {label.upper()}\n\n"
-                "Введите @username, публичную ссылку или другой "
-                "идентификатор объекта.\n\n"
-                ""
-            ),
-            kb_back_home(),
-        )
-
-    elif data == "hug:yes":
-
-        if not context.user_data.get(
-            "hug_target"
-        ):
-
-            await send_ui(
-                update,
-                context,
-                (
-                    "❌ Получатель не выбран.\n\n"
-                    "Сначала введите аккаунт."
-                ),
-                kb_menu(),
-            )
-
-            return
-
-        await confirm_and_send_hug(
-            update,
-            context,
-            user_id,
-        )
-
-    elif data == "hug:no":
-
-        context.user_data["state"] = None
-
-        context.user_data.pop(
-            "hug_target",
-            None,
-        )
-
-        await send_ui(
-            update,
-            context,
-            "❌ Отменено.",
-            kb_menu(),
         )
 
 
@@ -9024,6 +8639,16 @@ async def internal_callback(
         if target_type not in INTERNAL_TARGET_TYPES:
             return
         context.user_data["internal_target_type"] = target_type
+        if target_type == "bot":
+            # У ботов не бывает приватности — доступ всегда публичный.
+            context.user_data["internal_visibility"] = "public"
+            context.user_data["state"] = "internal_target"
+            await send_ui(
+                update, context,
+                "🤖 Бот\n\nБоты всегда публичные, вопрос доступа пропускаю.\n\nШаг 3/5 · пришлите @username бота:",
+                kb_internal(),
+            )
+            return
         context.user_data["state"] = "internal_visibility"
         await send_ui(
             update, context,
@@ -10717,49 +10342,6 @@ async def handle_text(
     # ---------------------------------------------
     # HUG TARGET
     # ---------------------------------------------
-
-    if state == "awaiting_hug_target":
-
-        context.user_data[
-            "hug_target"
-        ] = text
-
-        context.user_data["state"] = (
-            "awaiting_confirm"
-        )
-
-        hug_target_type = context.user_data.get(
-            "hug_target_type",
-            "user",
-        )
-        hug_target_label = HUG_TARGET_TYPES.get(
-            hug_target_type,
-            "👤 аккаунта",
-        )
-
-        await update.message.reply_text(
-            (
-                f"Вы уверены, что хотите "
-                f"выполнить обработку для "
-                f"{hug_target_label} {text}?"
-            ),
-            reply_markup=kb_confirm_hug(),
-        )
-
-        return
-
-    # ---------------------------------------------
-    # CONFIRM
-    # ---------------------------------------------
-
-    if state == "awaiting_confirm":
-
-        await update.message.reply_text(
-            "Нажмите кнопку выше 👆",
-            reply_markup=kb_confirm_hug(),
-        )
-
-        return
 
     # ---------------------------------------------
     # PROMO
