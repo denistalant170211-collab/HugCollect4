@@ -17,7 +17,9 @@ from typing import Any
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from supabase import create_client
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
+from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.tl.functions.channels import JoinChannelRequest
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -229,6 +231,342 @@ def internal_storage_ready() -> bool:
         and TELEGRAM_API_ID
         and TELEGRAM_API_HASH
     )
+
+
+# =========================================================
+# INTERNAL REPORT ENGINE (TelReper technology, fixed)
+# =========================================================
+# Реальный внутряк: жалобы уходят через userbot-сессии из
+# Supabase Storage. Старый код слал messages.ReportRequest с
+# пустым option и считал это отправкой — Telegram на такое
+# отвечает ReportResultChooseOption (списком опций), а не
+# принятием жалобы. Здесь двухшаговая схема:
+#   1) account.ReportPeerRequest — репорт уровня канала/чата;
+#   2) messages.ReportRequest: пустой option -> ChooseOption ->
+#      повторный вызов с выбранной опцией.
+
+REPORTS_PER_ACCOUNT = max(
+    1,
+    int(os.environ.get("REPORTS_PER_ACCOUNT", "2")),
+)
+INTERNAL_MAX_PARALLEL = max(
+    1,
+    min(10, int(os.environ.get("INTERNAL_MAX_PARALLEL", "3"))),
+)
+
+INTERNAL_REPORT_REASONS: dict[str, tuple[Any, str]] = {
+    "spam": (
+        types.InputReportReasonSpam,
+        "Прошу проверить объект на признаки спама.",
+    ),
+    "fake": (
+        types.InputReportReasonFake,
+        "Прошу проверить объект на выдачу себя за другое лицо.",
+    ),
+    "violence": (
+        types.InputReportReasonViolence,
+        "Прошу проверить объект на материалы с пропагандой насилия.",
+    ),
+    "child_abuse": (
+        types.InputReportReasonChildAbuse,
+        "Прошу проверить объект на материалы о жестоком обращении с детьми.",
+    ),
+    "pornography": (
+        types.InputReportReasonPornography,
+        "Прошу проверить объект на порнографический контент.",
+    ),
+    "geo_irrelevant": (
+        types.InputReportReasonGeoIrrelevant,
+        "Прошу проверить объект на нерелевантное географическое содержание.",
+    ),
+    "copyright": (
+        types.InputReportReasonCopyright,
+        "Прошу проверить объект на нарушение авторских прав.",
+    ),
+    "illegal_drugs": (
+        types.InputReportReasonIllegalDrugs,
+        "Прошу проверить объект на материалы о незаконных наркотиках.",
+    ),
+    "personal_details": (
+        types.InputReportReasonPersonalDetails,
+        "Прошу проверить объект на раскрытие персональных данных.",
+    ),
+    "other": (
+        types.InputReportReasonOther,
+        "Прошу проверить объект по указанному основанию.",
+    ),
+}
+
+INTERNAL_DEFAULT_REASON = (
+    os.environ.get("INTERNAL_DEFAULT_REASON", "spam").strip().lower()
+)
+if INTERNAL_DEFAULT_REASON not in INTERNAL_REPORT_REASONS:
+    INTERNAL_DEFAULT_REASON = "spam"
+
+JOB_STATUS_RU = {
+    "prepared": "🟡 Подготовлено",
+    "running": "🔵 Выполняется",
+    "done": "🟢 Выполнено",
+    "failed": "🔴 Ошибка",
+    "no_sessions": "⚪ Нет сессий",
+}
+
+
+def set_internal_job_status(
+    job_id: int,
+    status: str,
+    error: str | None = None,
+    sent_count: int | None = None,
+) -> None:
+    with db() as conn:
+        if sent_count is None:
+            conn.execute(
+                """
+                UPDATE internal_jobs
+                SET status=%s,
+                    error=%s,
+                    updated_at=%s
+                WHERE id=%s
+                """,
+                (status, error, utcnow(), job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE internal_jobs
+                SET status=%s,
+                    error=%s,
+                    sent_count=%s,
+                    updated_at=%s
+                WHERE id=%s
+                """,
+                (status, error, sent_count, utcnow(), job_id),
+            )
+        conn.commit()
+
+
+async def _report_with_session(
+    session_base: str,
+    target: str,
+    reason: Any,
+    text: str,
+    per_account: int,
+) -> int:
+    sent = 0
+    client = TelegramClient(
+        session_base,
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+    )
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return 0
+        try:
+            entity = await client.get_entity(target)
+        except Exception:
+            return 0
+        try:
+            await client(JoinChannelRequest(entity))
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+        try:
+            recent = await client.get_messages(entity, limit=5)
+            message_ids = [m.id for m in recent if m and m.id]
+        except Exception:
+            message_ids = []
+        for _ in range(per_account):
+            try:
+                await client(
+                    functions.account.ReportPeerRequest(
+                        peer=entity,
+                        reason=reason,
+                        message=text,
+                    )
+                )
+                sent += 1
+                if message_ids:
+                    try:
+                        res = await client(
+                            functions.messages.ReportRequest(
+                                peer=entity,
+                                id=message_ids,
+                                option=b"",
+                                message=text,
+                            )
+                        )
+                        if isinstance(
+                            res,
+                            types.ReportResultChooseOption,
+                        ) and res.options:
+                            await client(
+                                functions.messages.ReportRequest(
+                                    peer=entity,
+                                    id=message_ids,
+                                    option=res.options[0].option,
+                                    message=text,
+                                )
+                            )
+                    except Exception:
+                        pass
+            except FloodWaitError as exc:
+                await asyncio.sleep(exc.seconds + 2)
+            except Exception as exc:
+                logger.warning("internal report failed: %s", exc)
+                await asyncio.sleep(2)
+        return sent
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def run_internal_reports(
+    target: str,
+    reason_key: str,
+    per_account: int | None = None,
+    report_text: str | None = None,
+    progress_cb=None,
+) -> tuple[int, int, list[str]]:
+    """Report *target* from every Supabase session.
+
+    Returns (sent_total, accounts_used, errors).
+    """
+    per_account = per_account or REPORTS_PER_ACCOUNT
+    reason_cls, default_text = INTERNAL_REPORT_REASONS.get(
+        reason_key or INTERNAL_DEFAULT_REASON,
+        INTERNAL_REPORT_REASONS["other"],
+    )
+    text = (report_text or default_text)[:500]
+    target = (target or "").strip()
+    if not target:
+        return (0, 0, ["empty_target"])
+    if not internal_storage_ready():
+        return (0, 0, ["storage_not_configured"])
+    names = await list_internal_session_files()
+    if not names:
+        return (0, 0, ["no_sessions"])
+
+    sem = asyncio.Semaphore(INTERNAL_MAX_PARALLEL)
+    total_sent = 0
+    used = 0
+    errors: list[str] = []
+    done = 0
+    plan = len(names) * per_account
+
+    async def worker(name: str):
+        nonlocal total_sent, used, done
+        local: Path | None = None
+        try:
+            async with sem:
+                local = await download_internal_session(name)
+                base = str(local.with_suffix(""))
+                n = await _report_with_session(
+                    base,
+                    target,
+                    reason_cls(),
+                    text,
+                    per_account,
+                )
+                total_sent += n
+                if n:
+                    used += 1
+        except Exception as exc:
+            errors.append(f"{name}: {exc}"[:200])
+        finally:
+            done += per_account
+            if progress_cb:
+                try:
+                    if asyncio.iscoroutinefunction(progress_cb):
+                        await progress_cb(min(done, plan), plan)
+                    else:
+                        progress_cb(min(done, plan), plan)
+                except Exception:
+                    pass
+            if local is not None:
+                try:
+                    local.unlink(missing_ok=True)
+                    Path(str(local.with_suffix("")) + ".session-journal").unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
+
+    await asyncio.gather(*[worker(n) for n in names])
+    return (total_sent, used, errors)
+
+
+async def execute_internal_job(
+    job_id: int,
+    target: str,
+    reason_key: str,
+    prepared_text: str,
+    user_id: int,
+    bot,
+) -> None:
+    set_internal_job_status(job_id, "running")
+    try:
+        await bot.send_message(
+            user_id,
+            f"🚀 Задание #{job_id} запущено.\n🎯 {target}",
+        )
+    except Exception:
+        pass
+    try:
+        sent, used, errors = await run_internal_reports(
+            target,
+            reason_key,
+            REPORTS_PER_ACCOUNT,
+            prepared_text,
+        )
+    except Exception as exc:
+        logger.exception("internal job failed: job=%s", job_id)
+        set_internal_job_status(job_id, "failed", str(exc)[:500], 0)
+        try:
+            await bot.send_message(
+                user_id,
+                f"❌ Задание #{job_id} упало с ошибкой.",
+            )
+        except Exception:
+            pass
+        return
+
+    if errors == ["no_sessions"] or errors == ["storage_not_configured"]:
+        status = "no_sessions"
+    elif sent > 0:
+        status = "done"
+    else:
+        status = "failed"
+    set_internal_job_status(
+        job_id,
+        status,
+        ("; ".join(errors))[:500] if errors else None,
+        sent,
+    )
+    try:
+        if status == "done":
+            await bot.send_message(
+                user_id,
+                f"✅ Задание #{job_id} выполнено.\n\n"
+                f"📤 Отправлено жалоб — {sent}\n"
+                f"👥 Аккаунтов сработало — {used}",
+            )
+        elif status == "no_sessions":
+            await bot.send_message(
+                user_id,
+                f"⚪ Задание #{job_id}: нет рабочих сессий.\n\n"
+                "Загрузите .session в Supabase Storage.",
+            )
+        else:
+            await bot.send_message(
+                user_id,
+                f"❌ Задание #{job_id} не дало отправок.\n\n"
+                f"{('; '.join(errors))[:500] if errors else ''}",
+            )
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -1394,6 +1732,8 @@ def init_db():
                 text_mode TEXT NOT NULL,
                 prepared_text TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'prepared',
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             )
@@ -1462,6 +1802,8 @@ def init_db():
             "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS bot_username TEXT",
             "ALTER TABLE bot_mirrors ADD COLUMN IF NOT EXISTS token_fingerprint TEXT",
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ban_reason TEXT",
+            "ALTER TABLE internal_jobs ADD COLUMN IF NOT EXISTS sent_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE internal_jobs ADD COLUMN IF NOT EXISTS error TEXT",
         ]
 
         for sql in migrations:
@@ -4727,6 +5069,7 @@ async def channel_gate(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     user = update.effective_user
+    q = update.callback_query
 
     if not user or user.is_bot:
         return
@@ -5092,26 +5435,48 @@ async def run_hug_animation(
     target: str,
     target_type: str = "user",
 ):
-    """Run the progress animation and always send the completion message.
+    """Real work: report the target from Supabase sessions with live progress.
 
-    The previous version referenced ``type_label`` before defining it, so the
-    coroutine raised NameError immediately after 100%, leaving the user stuck
-    on the 100% step.
+    Progress percents are driven by actual per-account completion, and the
+    finish message carries the real sent count.
     """
     type_label = HUG_TARGET_TYPES.get(
         target_type,
         "👤 аккаунта",
     )
-    count = 356
+    milestones = [8, 20, 34, 49, 68, 71, 90]
+    milestone_idx = [0]
+
+    async def on_progress(done: int, total: int):
+        frac = done / max(total, 1)
+        while (
+            milestone_idx[0] < len(milestones)
+            and frac >= milestones[milestone_idx[0]] / 100
+        ):
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"💤{milestones[milestone_idx[0]]}%💤",
+                )
+            except Exception:
+                pass
+            milestone_idx[0] += 1
 
     try:
-        await asyncio.sleep(1)
-        for percent in [8, 20, 34, 49, 68, 71, 90]:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"💤{percent}%💤",
-            )
+        sent = 0
+        used = 0
+        errors: list[str] = []
+        if internal_storage_ready():
             await asyncio.sleep(1)
+            sent, used, errors = await run_internal_reports(
+                target,
+                INTERNAL_DEFAULT_REASON,
+                REPORTS_PER_ACCOUNT,
+                render_internal_template(INTERNAL_DEFAULT_REASON, target),
+                progress_cb=on_progress,
+            )
+        else:
+            logger.warning("hug without sessions: storage not configured")
 
         await bot.send_message(
             chat_id=chat_id,
@@ -5124,7 +5489,7 @@ async def run_hug_animation(
             add_hug(
                 user_id,
                 target,
-                1,
+                sent,
                 target_type=target_type,
             )
         except Exception:
@@ -5138,18 +5503,34 @@ async def run_hug_animation(
                 {
                     "target": target,
                     "target_type": target_type,
+                    "sent": sent,
+                    "accounts_used": used,
                 },
             )
         except Exception:
             logger.exception("Could not log processing attempt")
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
+        if sent > 0:
+            finish_text = (
                 "✅ Работа завершена.\n\n"
+                f"📤 Отправлено — {sent}\n\n"
                 "⏳ Ждём результата.\n\n"
                 "Ура! 🎉"
-            ),
+            )
+        elif errors == ["no_sessions"] or errors == ["storage_not_configured"]:
+            finish_text = (
+                "⚠️ Работа не запущена: нет рабочих сессий.\n\n"
+                "Администратор должен загрузить .session в хранилище."
+            )
+        else:
+            finish_text = (
+                "❌ Работа не дала отправок.\n\n"
+                "Попробуйте позже."
+            )
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=finish_text,
             reply_markup=kb_hooray(),
         )
     except asyncio.CancelledError:
@@ -5471,12 +5852,14 @@ async def show_internal_jobs(
         label = INTERNAL_TARGET_TYPES.get(row["target_type"], row["target_type"])
         vis = INTERNAL_VISIBILITIES.get(row["visibility"], row["visibility"])
         reason = MODERATION_REASONS.get(row["reason"], row["reason"])
+        status = JOB_STATUS_RU.get(row["status"], row["status"])
+        sent_line = f"\n📤 Отправлено — {row.get('sent_count', 0)}" if row.get("sent_count") else ""
         lines.append(
             f"#{row['id']} · {label} · {vis}\n"
             f"🎯 {row['target']}\n"
             f"{reason}\n"
             f"📝 {row['text_mode']}\n"
-            f"🟡 {row['status']}\n"
+            f"{status}{sent_line}\n"
             f"{aware(row['created_at']).strftime('%d.%m.%Y %H:%M')}"
         )
 
@@ -8698,8 +9081,19 @@ async def internal_callback(
         context.user_data["state"] = None
         await send_ui(
             update, context,
-            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\nАвтоматической массовой отправки жалоб из нескольких аккаунтов этот модуль не выполняет.",
+            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\n🚀 Запускаю выполнение...",
             kb_internal(),
+        )
+        context.application.create_task(
+            execute_internal_job(
+                job_id,
+                target,
+                reason,
+                prepared,
+                user_id,
+                context.bot,
+            ),
+            update=update,
         )
         return
 
@@ -9645,8 +10039,19 @@ async def handle_text(
         )
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\nАвтоматической массовой отправки жалоб из нескольких аккаунтов этот модуль не выполняет.",
+            f"✅ Задание #{job_id} создано.\n\n{prepared}\n\n🚀 Запускаю выполнение...",
             reply_markup=kb_internal(),
+        )
+        context.application.create_task(
+            execute_internal_job(
+                job_id,
+                target,
+                reason,
+                prepared,
+                user_id,
+                context.bot,
+            ),
+            update=update,
         )
         return
 
