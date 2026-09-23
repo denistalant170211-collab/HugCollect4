@@ -24,6 +24,8 @@ from telethon.errors.rpcerrorlist import (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
+
+from proxy_pool import ProxyPool, parse_proxy_tuple
 from telethon.tl.functions.channels import JoinChannelRequest
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
@@ -272,41 +274,39 @@ INTERNAL_MAX_PARALLEL = max(
 )
 
 INTERNAL_REPORT_REASONS: dict[str, tuple[Any, str]] = {
-    "spam": (
-        types.InputReportReasonSpam,
-        "Прошу проверить объект на признаки спама.",
-    ),
-    "fake": (
-        types.InputReportReasonFake,
-        "Прошу проверить объект на выдачу себя за другое лицо.",
-    ),
-    "violence": (
-        types.InputReportReasonViolence,
-        "Прошу проверить объект на материалы с пропагандой насилия.",
-    ),
-    "child_abuse": (
-        types.InputReportReasonChildAbuse,
-        "Прошу проверить объект на материалы о жестоком обращении с детьми.",
+    "personal_details": (
+        types.InputReportReasonPersonalDetails,
+        "Прошу проверить объект на раскрытие персональных данных.",
     ),
     "pornography": (
         types.InputReportReasonPornography,
         "Прошу проверить объект на порнографический контент.",
     ),
-    "geo_irrelevant": (
-        types.InputReportReasonGeoIrrelevant,
-        "Прошу проверить объект на нерелевантное географическое содержание.",
-    ),
-    "copyright": (
-        types.InputReportReasonCopyright,
-        "Прошу проверить объект на нарушение авторских прав.",
-    ),
     "illegal_drugs": (
         types.InputReportReasonIllegalDrugs,
         "Прошу проверить объект на материалы о незаконных наркотиках.",
     ),
-    "personal_details": (
-        types.InputReportReasonPersonalDetails,
-        "Прошу проверить объект на раскрытие персональных данных.",
+    "child_abuse": (
+        types.InputReportReasonChildAbuse,
+        "Прошу проверить объект на материалы о жестоком обращении с детьми.",
+    ),
+    "violence": (
+        types.InputReportReasonViolence,
+        "Прошу проверить объект на материалы с пропагандой насилия.",
+    ),
+    "fake": (
+        types.InputReportReasonFake,
+        "Прошу проверить объект на выдачу себя за другое лицо.",
+    ),
+    # У Telegram нет отдельной причины "фишинг" — ближайший
+    # официальный bucket это спам, текст уточняет мошенничество.
+    "phishing": (
+        types.InputReportReasonSpam,
+        "Прошу проверить объект на фишинг и мошенничество.",
+    ),
+    "spam": (
+        types.InputReportReasonSpam,
+        "Прошу проверить объект на спам и рекламу.",
     ),
     "other": (
         types.InputReportReasonOther,
@@ -326,7 +326,122 @@ JOB_STATUS_RU = {
     "done": "🟢 Выполнено",
     "failed": "🔴 Ошибка",
     "no_sessions": "⚪ Нет сессий",
+    "stopped": "⏹ Остановлено",
 }
+
+# Пачка 2: живучесть. Ротация причин/текстов, slow burn,
+# карантин сессий, прокси, стоп-кнопка, маскировка клиентов.
+REPORT_REASON_JITTER = os.environ.get("REPORT_REASON_JITTER", "0").strip() == "1"
+SLOW_BURN_MINUTES = max(
+    0,
+    int(os.environ.get("SLOW_BURN_MINUTES", "0")),
+)
+
+# Соседние причины для джиттера: 30% аккаунтов шлют соседнюю
+# вместо основной, пачка не выглядит скоординированной.
+REASON_NEIGHBORS: dict[str, list[str]] = {
+    "personal_details": ["other", "fake"],
+    "pornography": ["other", "child_abuse"],
+    "illegal_drugs": ["other", "violence"],
+    "child_abuse": ["violence", "other"],
+    "violence": ["other", "child_abuse"],
+    "fake": ["phishing", "other"],
+    "phishing": ["spam", "fake"],
+    "spam": ["phishing", "fake", "other"],
+    "other": ["spam", "fake"],
+}
+
+# Нейтральные хвосты — разбивают точное совпадение текста у 50 акков.
+TEXT_VARIANT_TAILS = [
+    "",
+    "\nПрошу принять меры.",
+    "\nСпасибо за проверку.",
+    "\nКонтент нарушает правила Telegram.",
+    "\nПрошу проверить в приоритетном порядке.",
+    "\nТакое нельзя оставлять без внимания.",
+]
+
+# Маскировка MTProto-клиентов: разные девайсы вместо одного Desktop.
+DEVICE_PROFILES = [
+    {"device_model": "Desktop", "system_version": "Windows 10", "app_version": "4.16.8"},
+    {"device_model": "Desktop", "system_version": "Windows 11", "app_version": "5.3.2"},
+    {"device_model": "MacBook Pro", "system_version": "macOS 14.4", "app_version": "10.14.1"},
+    {"device_model": "Galaxy S23", "system_version": "Android 14", "app_version": "10.6.2"},
+    {"device_model": "Pixel 8", "system_version": "Android 14", "app_version": "10.6.1"},
+    {"device_model": "iPhone 15", "system_version": "iOS 17.4", "app_version": "10.5"},
+    {"device_model": "Redmi Note 13", "system_version": "Android 13", "app_version": "10.2.3"},
+]
+
+PROXY_MODE = os.environ.get("PROXY_MODE", "auto").strip().lower()
+PROXY_SOURCES = [
+    s.strip()
+    for s in os.environ.get(
+        "PROXY_SOURCES",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt,"
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,"
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    ).split(",")
+    if s.strip()
+]
+PROXY_REFRESH_SEC = max(
+    60,
+    int(os.environ.get("PROXY_REFRESH_SEC", "900")),
+)
+PROXY_POOL = None
+
+# Запущенные задания: job_id -> asyncio.Event для стоп-кнопки.
+RUNNING_JOBS: dict[int, asyncio.Event] = {}
+
+
+def pick_report_variant(
+    reason_key: str, base_text: str
+) -> tuple[Any, str]:
+    """Причина (+джиттер) и текст (+хвост) для одного аккаунта."""
+    key = reason_key or INTERNAL_DEFAULT_REASON
+    if REPORT_REASON_JITTER and random.random() < 0.3:
+        neighbors = REASON_NEIGHBORS.get(key, [])
+        if neighbors:
+            key = random.choice(neighbors)
+    reason_cls, default_text = INTERNAL_REPORT_REASONS.get(
+        key, INTERNAL_REPORT_REASONS["other"]
+    )
+    text = (base_text or default_text) + random.choice(TEXT_VARIANT_TAILS)
+    return reason_cls(), text[:500]
+
+
+def quarantine_session(storage_path: str, seconds: int) -> None:
+    until = utcnow() + timedelta(seconds=max(60, seconds))
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO internal_sessions(
+                storage_path, status, last_error,
+                last_checked_at, created_at, updated_at, flood_until
+            )
+            VALUES(%s,'quarantined','flood',%s,%s,%s,%s)
+            ON CONFLICT(storage_path) DO UPDATE SET
+                status='quarantined',
+                flood_until=EXCLUDED.flood_until,
+                updated_at=EXCLUDED.updated_at
+            """,
+            (storage_path, until, until, until, until),
+        )
+        conn.commit()
+    logger.warning("session quarantined: %s until %s", storage_path, until)
+
+
+def is_quarantined(storage_path: str) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT flood_until FROM internal_sessions WHERE storage_path=%s",
+            (storage_path,),
+        ).fetchone()
+    if not row or not row["flood_until"]:
+        return False
+    until = aware(row["flood_until"])
+    if until and until > utcnow():
+        return True
+    return False
 
 
 def set_internal_job_status(
@@ -364,38 +479,84 @@ def set_internal_job_status(
 
 async def _report_with_session(
     session_base: str,
+    storage_name: str,
     target: str,
-    reason: Any,
-    text: str,
+    reason_key: str,
+    base_text: str,
     per_account: int,
+    stop_event=None,
+    proxy_url: str | None = None,
 ) -> int:
     sent = 0
-    client = TelegramClient(
-        session_base,
-        TELEGRAM_API_ID,
-        TELEGRAM_API_HASH,
-    )
+    device = random.choice(DEVICE_PROFILES)
+    proxy = parse_proxy_tuple(proxy_url) if proxy_url else None
+
+    def _make_client(proxy_arg):
+        return TelegramClient(
+            session_base,
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+            device_model=device["device_model"],
+            system_version=device["system_version"],
+            app_version=device["app_version"],
+            lang_code="ru",
+            system_lang_code="ru-RU",
+            proxy=proxy_arg,
+        )
+
+    client = _make_client(proxy)
     try:
-        await client.connect()
+        try:
+            await client.connect()
+        except (OSError, asyncio.TimeoutError) as exc:
+            # Прокси сдох — в auto идём напрямую, иначе пропускаем акк.
+            if proxy_url and PROXY_MODE == "auto":
+                if PROXY_POOL is not None:
+                    PROXY_POOL.mark_bad(proxy_url)
+                logger.warning("proxy dead, retry direct: %s", proxy_url)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client = _make_client(None)
+                await client.connect()
+            else:
+                raise
+        if proxy_url and PROXY_POOL is not None:
+            PROXY_POOL.mark_good(proxy_url)
         if not await client.is_user_authorized():
             return 0
         try:
             entity = await client.get_entity(target)
         except Exception:
             return 0
+        # Часть акков вступает в канал, часть бьёт со стороны — как живые.
+        if random.random() < 0.7:
+            try:
+                await client(JoinChannelRequest(entity))
+                await asyncio.sleep(1)
+            except Exception:
+                pass
         try:
-            await client(JoinChannelRequest(entity))
-            await asyncio.sleep(1)
+            recent = await client.get_messages(entity, limit=10)
+            all_ids = [m.id for m in recent if m and m.id]
         except Exception:
-            pass
-        try:
-            recent = await client.get_messages(entity, limit=5)
-            message_ids = [m.id for m in recent if m and m.id]
-        except Exception:
-            message_ids = []
+            all_ids = []
         for _ in range(per_account):
+            if stop_event is not None and stop_event.is_set():
+                break
             # Пауза ДО выстрела — иначе при per_account=1 она бесполезна.
             await asyncio.sleep(REPORT_DELAY_SEC + random.uniform(0, 2))
+            if stop_event is not None and stop_event.is_set():
+                break
+            reason, text = pick_report_variant(reason_key, base_text)
+            # Каждый акк жалуется на свой случайный поднабор постов.
+            if all_ids:
+                message_ids = random.sample(
+                    all_ids, random.randint(1, min(3, len(all_ids)))
+                )
+            else:
+                message_ids = []
             try:
                 peer_ok = await client(
                     functions.account.ReportPeerRequest(
@@ -448,6 +609,7 @@ async def _report_with_session(
                     except Exception:
                         pass
             except FloodWaitError as exc:
+                quarantine_session(storage_name, exc.seconds + 300)
                 await asyncio.sleep(exc.seconds + 2)
             except Exception as exc:
                 logger.warning("internal report failed: %s", exc)
@@ -466,6 +628,7 @@ async def run_internal_reports(
     per_account: int | None = None,
     report_text: str | None = None,
     progress_cb=None,
+    stop_event=None,
 ) -> tuple[int, int, list[str], list[dict]]:
     """Report *target* from every Supabase session.
 
@@ -473,11 +636,11 @@ async def run_internal_reports(
     breakdown = [{"session": name, "sent": n}, ...] — пруфы по каждой учетке.
     """
     per_account = per_account or REPORTS_PER_ACCOUNT
-    reason_cls, default_text = INTERNAL_REPORT_REASONS.get(
+    default_text = INTERNAL_REPORT_REASONS.get(
         reason_key or INTERNAL_DEFAULT_REASON,
         INTERNAL_REPORT_REASONS["other"],
-    )
-    text = (report_text or default_text)[:500]
+    )[1]
+    text = report_text or default_text
     target = (target or "").strip()
     if not target:
         return (0, 0, ["empty_target"], [])
@@ -498,29 +661,50 @@ async def run_internal_reports(
     async def worker(idx: int, name: str):
         nonlocal total_sent, used, done
         local: Path | None = None
-        # Растягиваем старт, чтобы все аккаунты не били одновременно.
-        await asyncio.sleep(min(idx, 15) * REPORT_STAGGER_SEC + random.uniform(0, 1))
+        if stop_event is not None and stop_event.is_set():
+            return
+        if SLOW_BURN_MINUTES > 0:
+            # Медленный режим: старты размазаны на всё окно.
+            await asyncio.sleep(random.uniform(0, SLOW_BURN_MINUTES * 60))
+        else:
+            # Растягиваем старт, чтобы все аккаунты не били одновременно.
+            await asyncio.sleep(min(idx, 15) * REPORT_STAGGER_SEC + random.uniform(0, 1))
+        if stop_event is not None and stop_event.is_set():
+            return
         try:
-            async with sem:
-                local = await download_internal_session(name)
-                base = str(local.with_suffix(""))
-                n = await _report_with_session(
-                    base,
-                    target,
-                    reason_cls(),
-                    text,
-                    per_account,
-                )
-                total_sent += n
-                if n:
-                    used += 1
-                breakdown.append({"session": name, "sent": n})
-                logger.info(
-                    "internal session done: storage=%s sent=%d/%d",
-                    name,
-                    n,
-                    per_account,
-                )
+            if is_quarantined(name):
+                logger.info("session skipped (quarantine): %s", name)
+                errors.append(f"{name}: quarantined")
+            else:
+                proxy_url = None
+                if PROXY_POOL is not None and PROXY_POOL.enabled():
+                    try:
+                        proxy_url = await PROXY_POOL.get_proxy()
+                    except Exception:
+                        proxy_url = None
+                async with sem:
+                    local = await download_internal_session(name)
+                    base = str(local.with_suffix(""))
+                    n = await _report_with_session(
+                        base,
+                        name,
+                        target,
+                        reason_key,
+                        text,
+                        per_account,
+                        stop_event=stop_event,
+                        proxy_url=proxy_url,
+                    )
+                    total_sent += n
+                    if n:
+                        used += 1
+                    breakdown.append({"session": name, "sent": n})
+                    logger.info(
+                        "internal session done: storage=%s sent=%d/%d",
+                        name,
+                        n,
+                        per_account,
+                    )
         except Exception as exc:
             errors.append(f"{name}: {exc}"[:200])
         finally:
@@ -555,11 +739,24 @@ async def execute_internal_job(
     user_id: int,
     bot,
 ) -> None:
+    stop_event = asyncio.Event()
+    RUNNING_JOBS[job_id] = stop_event
     set_internal_job_status(job_id, "running")
+    stop_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🛑 Остановить",
+                    callback_data=f"internal:stop:{job_id}",
+                )
+            ]
+        ]
+    )
     try:
         await bot.send_message(
             user_id,
             f"🚀 Задание #{job_id} запущено.\n🎯 {target}",
+            reply_markup=stop_kb,
         )
     except Exception:
         pass
@@ -569,9 +766,11 @@ async def execute_internal_job(
             reason_key,
             REPORTS_PER_ACCOUNT,
             prepared_text,
+            stop_event=stop_event,
         )
     except Exception as exc:
         logger.exception("internal job failed: job=%s", job_id)
+        RUNNING_JOBS.pop(job_id, None)
         set_internal_job_status(job_id, "failed", str(exc)[:500], 0)
         try:
             log_event(
@@ -591,12 +790,15 @@ async def execute_internal_job(
             pass
         return
 
-    if errors == ["no_sessions"] or errors == ["storage_not_configured"]:
+    if stop_event.is_set():
+        status = "stopped"
+    elif errors == ["no_sessions"] or errors == ["storage_not_configured"]:
         status = "no_sessions"
     elif sent > 0:
         status = "done"
     else:
         status = "failed"
+    RUNNING_JOBS.pop(job_id, None)
     set_internal_job_status(
         job_id,
         status,
@@ -629,6 +831,12 @@ async def execute_internal_job(
                 f"✅ Задание #{job_id} выполнено.\n\n"
                 f"📤 Отправлено жалоб — {sent}\n"
                 f"👥 Аккаунтов сработало — {used}",
+            )
+        elif status == "stopped":
+            await bot.send_message(
+                user_id,
+                f"🛑 Задание #{job_id} остановлено.\n\n"
+                f"📤 Успело уйти — {sent}",
             )
         elif status == "no_sessions":
             await bot.send_message(
@@ -672,16 +880,15 @@ MAINTENANCE_TEXT = (
 # =========================================================
 
 MODERATION_REASONS = {
-    "spam": "🚫 Спам",
-    "violence": "⚠️ Насилие",
-    "pornography": "🔞 Порнография",
-    "child_abuse": "🚸 Жестокое обращение с детьми",
+    "personal_details": "👤 Личные данные",
+    "pornography": "🛡 Порнография",
+    "illegal_drugs": "💊 Наркотики",
+    "child_abuse": "🚸 Детская порнография",
+    "violence": "🔥 Насилие",
+    "fake": "🎭 Фейк",
+    "phishing": "🎣 Фишинг",
+    "spam": "🚫 Спам / реклама",
     "other": "📝 Другое",
-    "copyright": "©️ Авторские права",
-    "geo_irrelevant": "📍 Нерелевантная геогруппа",
-    "fake": "👤 Выдача себя за другого",
-    "illegal_drugs": "💊 Незаконные наркотики",
-    "personal_details": "🔐 Раскрытие персональных данных",
 }
 
 INTERNAL_TARGET_TYPES = {
@@ -696,16 +903,15 @@ INTERNAL_VISIBILITIES = {
 }
 
 INTERNAL_REASON_TEMPLATES = {
-    "spam": "Прошу проверить объект на признаки спама.\n\nОбъект: {target}",
-    "violence": "Прошу проверить объект на материалы с пропагандой или описанием насилия.\n\nОбъект: {target}",
-    "pornography": "Прошу проверить объект на порнографический контент.\n\nОбъект: {target}",
-    "child_abuse": "Прошу проверить объект на материалы, связанные с жестоким обращением с детьми.\n\nОбъект: {target}",
-    "other": "Прошу проверить объект по указанному пользователем основанию.\n\nОбъект: {target}",
-    "copyright": "Прошу проверить объект на возможное нарушение авторских прав.\n\nОбъект: {target}",
-    "geo_irrelevant": "Прошу проверить объект на нерелевантное географическое содержание.\n\nОбъект: {target}",
-    "fake": "Прошу проверить объект на выдачу себя за другое лицо или организацию.\n\nОбъект: {target}",
-    "illegal_drugs": "Прошу проверить объект на материалы, связанные с незаконными наркотиками.\n\nОбъект: {target}",
     "personal_details": "Прошу проверить объект на раскрытие персональных данных.\n\nОбъект: {target}",
+    "pornography": "Прошу проверить объект на порнографический контент.\n\nОбъект: {target}",
+    "illegal_drugs": "Прошу проверить объект на материалы, связанные с незаконными наркотиками.\n\nОбъект: {target}",
+    "child_abuse": "Прошу проверить объект на детскую порнографию.\n\nОбъект: {target}",
+    "violence": "Прошу проверить объект на материалы с пропагандой или описанием насилия.\n\nОбъект: {target}",
+    "fake": "Прошу проверить объект на выдачу себя за другое лицо или организацию.\n\nОбъект: {target}",
+    "phishing": "Прошу проверить объект на фишинг и мошенничество.\n\nОбъект: {target}",
+    "spam": "Прошу проверить объект на спам и рекламу.\n\nОбъект: {target}",
+    "other": "Прошу проверить объект по указанному пользователем основанию.\n\nОбъект: {target}",
 }
 
 
@@ -1834,6 +2040,7 @@ def init_db():
                 first_name TEXT,
                 last_error TEXT,
                 last_checked_at TIMESTAMPTZ,
+                flood_until TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             )
@@ -1898,6 +2105,7 @@ def init_db():
             "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ban_reason TEXT",
             "ALTER TABLE internal_jobs ADD COLUMN IF NOT EXISTS sent_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE internal_jobs ADD COLUMN IF NOT EXISTS error TEXT",
+            "ALTER TABLE internal_sessions ADD COLUMN IF NOT EXISTS flood_until TIMESTAMPTZ",
         ]
 
         for sql in migrations:
@@ -8758,6 +8966,27 @@ async def internal_callback(
         await show_internal_jobs(update, context)
         return
 
+    if data.startswith("internal:stop:"):
+        try:
+            stop_job_id = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        ev = RUNNING_JOBS.get(stop_job_id)
+        if ev is not None:
+            ev.set()
+            await send_ui(
+                update, context,
+                f"🛑 Задание #{stop_job_id} останавливается, дожимаю текущие...",
+                kb_internal(update.effective_user.id),
+            )
+        else:
+            await send_ui(
+                update, context,
+                f"ℹ️ Задание #{stop_job_id} уже не выполняется.",
+                kb_internal(update.effective_user.id),
+            )
+        return
+
     if data == "internal:sessions":
         await show_internal_sessions(update, context)
         return
@@ -11150,6 +11379,20 @@ async def post_init(
                 logger.error("stale webhook deleted, polling should recover")
     except Exception:
         logger.exception("webhook self-check failed")
+
+    global PROXY_POOL
+    if PROXY_MODE != "off" and PROXY_SOURCES:
+        try:
+            PROXY_POOL = ProxyPool(
+                mode=PROXY_MODE,
+                sources=PROXY_SOURCES,
+                refresh_sec=PROXY_REFRESH_SEC,
+            )
+            await PROXY_POOL.initialize()
+            logger.info("proxy pool init: mode=%s", PROXY_MODE)
+        except Exception:
+            logger.exception("proxy pool init failed, going direct")
+            PROXY_POOL = None
 
     asyncio.create_task(
         expiration_loop(
