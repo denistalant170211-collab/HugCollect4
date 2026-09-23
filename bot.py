@@ -254,6 +254,12 @@ REPORTS_PER_ACCOUNT = max(
     1,
     int(os.environ.get("REPORTS_PER_ACCOUNT", "2")),
 )
+# Пауза между жалобами одного аккаунта (плюс 0-2 сек джиттера).
+# Без пауз аккаунты строчат как роботы и быстрее ловят лимиты.
+REPORT_DELAY_SEC = max(
+    0,
+    int(os.environ.get("REPORT_DELAY_SEC", "3")),
+)
 INTERNAL_MAX_PARALLEL = max(
     1,
     min(10, int(os.environ.get("INTERNAL_MAX_PARALLEL", "5"))),
@@ -433,6 +439,7 @@ async def _report_with_session(
                             )
                     except Exception:
                         pass
+                await asyncio.sleep(REPORT_DELAY_SEC + random.uniform(0, 2))
             except FloodWaitError as exc:
                 await asyncio.sleep(exc.seconds + 2)
             except Exception as exc:
@@ -452,10 +459,11 @@ async def run_internal_reports(
     per_account: int | None = None,
     report_text: str | None = None,
     progress_cb=None,
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, list[str], list[dict]]:
     """Report *target* from every Supabase session.
 
-    Returns (sent_total, accounts_used, errors).
+    Returns (sent_total, accounts_used, errors, breakdown).
+    breakdown = [{"session": name, "sent": n}, ...] — пруфы по каждой учетке.
     """
     per_account = per_account or REPORTS_PER_ACCOUNT
     reason_cls, default_text = INTERNAL_REPORT_REASONS.get(
@@ -465,17 +473,18 @@ async def run_internal_reports(
     text = (report_text or default_text)[:500]
     target = (target or "").strip()
     if not target:
-        return (0, 0, ["empty_target"])
+        return (0, 0, ["empty_target"], [])
     if not internal_storage_ready():
-        return (0, 0, ["storage_not_configured"])
+        return (0, 0, ["storage_not_configured"], [])
     names = await list_internal_session_files()
     if not names:
-        return (0, 0, ["no_sessions"])
+        return (0, 0, ["no_sessions"], [])
 
     sem = asyncio.Semaphore(INTERNAL_MAX_PARALLEL)
     total_sent = 0
     used = 0
     errors: list[str] = []
+    breakdown: list[dict] = []
     done = 0
     plan = len(names) * per_account
 
@@ -496,6 +505,7 @@ async def run_internal_reports(
                 total_sent += n
                 if n:
                     used += 1
+                breakdown.append({"session": name, "sent": n})
                 logger.info(
                     "internal session done: storage=%s sent=%d/%d",
                     name,
@@ -524,7 +534,8 @@ async def run_internal_reports(
                     pass
 
     await asyncio.gather(*[worker(n) for n in names])
-    return (total_sent, used, errors)
+    breakdown.sort(key=lambda r: r["session"])
+    return (total_sent, used, errors, breakdown)
 
 
 async def execute_internal_job(
@@ -544,7 +555,7 @@ async def execute_internal_job(
     except Exception:
         pass
     try:
-        sent, used, errors = await run_internal_reports(
+        sent, used, errors, breakdown = await run_internal_reports(
             target,
             reason_key,
             REPORTS_PER_ACCOUNT,
@@ -553,6 +564,15 @@ async def execute_internal_job(
     except Exception as exc:
         logger.exception("internal job failed: job=%s", job_id)
         set_internal_job_status(job_id, "failed", str(exc)[:500], 0)
+        try:
+            log_event(
+                "ERROR",
+                "internal_job_failed",
+                user_id,
+                {"job_id": job_id, "target": target, "error": str(exc)[:500]},
+            )
+        except Exception:
+            pass
         try:
             await bot.send_message(
                 user_id,
@@ -574,6 +594,25 @@ async def execute_internal_job(
         ("; ".join(errors))[:500] if errors else None,
         sent,
     )
+    # Пруфы в ботовые логи — видно в админке, не только в Render.
+    try:
+        log_event(
+            "INFO",
+            "internal_job_done",
+            user_id,
+            {
+                "job_id": job_id,
+                "target": target,
+                "reason": reason_key,
+                "status": status,
+                "sent": sent,
+                "accounts_used": used,
+                "errors": errors,
+                "accounts": breakdown,
+            },
+        )
+    except Exception:
+        logger.exception("Could not log internal job result")
     try:
         if status == "done":
             await bot.send_message(
@@ -11084,6 +11123,24 @@ async def mirror_monitor_loop(application: Application):
 async def post_init(
     application: Application,
 ):
+
+    # Self-heal: залипший вебхук убивает поллинг вечным Conflict.
+    # В polling-режиме (нет публичного URL) любой зарегистрированный
+    # вебхук — мусор от прошлых запусков, удаляем автоматически.
+    try:
+        if not WEBHOOK_BASE:
+            info = await application.bot.get_webhook_info()
+            if info.url:
+                logger.error(
+                    "STALE WEBHOOK DETECTED url=%s pending=%s — deleting, "
+                    "it breaks polling with Conflict",
+                    info.url,
+                    info.pending_update_count,
+                )
+                await application.bot.delete_webhook(drop_pending_updates=False)
+                logger.error("stale webhook deleted, polling should recover")
+    except Exception:
+        logger.exception("webhook self-check failed")
 
     asyncio.create_task(
         expiration_loop(
