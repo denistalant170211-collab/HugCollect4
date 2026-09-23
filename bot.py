@@ -412,13 +412,24 @@ async def _report_with_session(
                             res,
                             types.ReportResultChooseOption,
                         ) and res.options:
-                            await client(
+                            res2 = await client(
                                 functions.messages.ReportRequest(
                                     peer=entity,
                                     id=message_ids,
                                     option=res.options[0].option,
                                     message=text,
                                 )
+                            )
+                            logger.info(
+                                "msg report receipt: base=%s %s",
+                                session_base,
+                                type(res2).__name__,
+                            )
+                        else:
+                            logger.info(
+                                "msg report receipt: base=%s %s",
+                                session_base,
+                                type(res).__name__,
                             )
                     except Exception:
                         pass
@@ -4345,9 +4356,6 @@ def kb_profile():
 def kb_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔎 Проверка", callback_data="menu:check"),
-        ],
-        [
             InlineKeyboardButton("⚙️ Внутряк", callback_data="menu:internal"),
         ],
         [
@@ -5427,75 +5435,8 @@ def profile_caption(
 # CHECK / SEARCH / HISTORY
 # =========================================================
 
-async def start_check(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-):
-
-    if not await require_subscription(
-        update,
-        context,
-        user_id,
-    ):
-        return
-
-    context.user_data["state"] = (
-        "awaiting_check_target"
-    )
-
-    await send_ui(
-        update,
-        context,
-        "Введите @username для проверки:",
-        kb_back_home(),
-    )
 
 
-async def do_check(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    target: str,
-):
-
-    if not await require_subscription(
-        update,
-        context,
-        user_id,
-    ):
-        return
-
-    ok, _used = request_usage(
-        user_id
-    )
-
-    if not ok:
-
-        await update.message.reply_text(
-            (
-                "⛔️ Лимит на сегодня исчерпан.\n\n"
-                f"Доступно {DAILY_REQUEST_LIMIT} "
-                "запросов в день."
-            ),
-            reply_markup=kb_menu(),
-        )
-
-        return
-
-    add_check(
-        user_id
-    )
-
-    await update.message.reply_text(
-        (
-            f"🔎 Результат проверки {target}\n\n"
-            f"🤗 Обнимашковость — "
-            f"{random.randint(60,100)}%\n\n"
-            "✅ Проверка завершена."
-        ),
-        reply_markup=kb_menu(),
-    )
 
 
 async def do_search(
@@ -8445,14 +8386,6 @@ async def nav_callback(
             context,
         )
 
-    elif data == "menu:check":
-
-        await start_check(
-            update,
-            context,
-            user_id,
-        )
-
     elif data == "menu:internal":
 
         if not await require_subscription(update, context, user_id):
@@ -10404,19 +10337,6 @@ async def handle_text(
     # ---------------------------------------------
     # CHECK
     # ---------------------------------------------
-
-    if state == "awaiting_check_target":
-
-        context.user_data["state"] = None
-
-        await do_check(
-            update,
-            context,
-            user_id,
-            text,
-        )
-
-        return
 
     # ---------------------------------------------
     # SEARCH
