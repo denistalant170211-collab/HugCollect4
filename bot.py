@@ -18,7 +18,12 @@ import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from supabase import create_client
 from telethon import TelegramClient, functions, types
-from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.errors.rpcerrorlist import (
+    ChannelPrivateError,
+    FloodWaitError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 from telethon.tl.functions.channels import JoinChannelRequest
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
@@ -378,14 +383,21 @@ async def _report_with_session(
             message_ids = []
         for _ in range(per_account):
             try:
-                await client(
+                peer_ok = await client(
                     functions.account.ReportPeerRequest(
                         peer=entity,
                         reason=reason,
                         message=text,
                     )
                 )
-                sent += 1
+                if peer_ok is True:
+                    sent += 1
+                else:
+                    logger.warning(
+                        "peer report not accepted: base=%s result=%r",
+                        session_base,
+                        peer_ok,
+                    )
                 if message_ids:
                     try:
                         res = await client(
@@ -473,6 +485,12 @@ async def run_internal_reports(
                 total_sent += n
                 if n:
                     used += 1
+                logger.info(
+                    "internal session done: storage=%s sent=%d/%d",
+                    name,
+                    n,
+                    per_account,
+                )
         except Exception as exc:
             errors.append(f"{name}: {exc}"[:200])
         finally:
@@ -1305,6 +1323,13 @@ async def mirror_bot_runner(mirror_id: int):
             return
 
         token = decrypt_mirror_token(row["bot_token_enc"])
+        if token == BOT_TOKEN:
+            logger.error(
+                "Mirror #%s holds the main BOT_TOKEN, deactivating",
+                mirror_id,
+            )
+            deactivate_mirror(mirror_id)
+            return
         app = build_bot_application(token)
         await app.initialize()
         await app.start()
@@ -1778,6 +1803,17 @@ def init_db():
                 last_latency_ms NUMERIC(18,3),
                 last_checked_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS target_watch (
+                target TEXT PRIMARY KEY,
+                last_status TEXT NOT NULL DEFAULT 'unknown',
+                last_checked_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL
             )
             """
         )
@@ -4323,15 +4359,20 @@ def kb_menu():
     ])
 
 
-def kb_internal():
-    return InlineKeyboardMarkup([
+def kb_internal(user_id=None):
+    rows = [
         [InlineKeyboardButton("➕ Новое задание", callback_data="internal:new")],
         [
             InlineKeyboardButton("📁 Мои задания", callback_data="internal:jobs"),
-            InlineKeyboardButton("🔐 Сессии", callback_data="internal:sessions"),
         ],
         [InlineKeyboardButton("🏠 На главную", callback_data="nav:home")],
-    ])
+    ]
+    # Сессии видит только админ. У остальных кнопки нет вообще.
+    if user_id is not None and is_admin(user_id):
+        rows[1].append(
+            InlineKeyboardButton("🔐 Сессии", callback_data="internal:sessions")
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_internal_target_types():
@@ -5544,7 +5585,7 @@ async def show_internal(
             "и шаблон текста.\n\n"
             "🔐 Сессии хранятся в приватном Supabase Storage."
         ),
-        kb_internal(),
+        kb_internal(update.effective_user.id),
     )
 
 
@@ -5559,7 +5600,7 @@ async def show_internal_jobs(
             update,
             context,
             "📁 МОИ ЗАДАНИЯ\n\nПока нет подготовленных заданий.",
-            kb_internal(),
+            kb_internal(update.effective_user.id),
         )
         return
 
@@ -5579,7 +5620,7 @@ async def show_internal_jobs(
             f"{aware(row['created_at']).strftime('%d.%m.%Y %H:%M')}"
         )
 
-    await send_ui(update, context, "\n\n".join(lines), kb_internal())
+    await send_ui(update, context, "\n\n".join(lines), kb_internal(update.effective_user.id))
 
 
 async def show_internal_sessions(
@@ -5588,7 +5629,7 @@ async def show_internal_sessions(
 ):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal())
+        await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal(update.effective_user.id))
         return
 
     if not internal_storage_ready():
@@ -8646,7 +8687,7 @@ async def internal_callback(
             await send_ui(
                 update, context,
                 "🤖 Бот\n\nБоты всегда публичные, вопрос доступа пропускаю.\n\nШаг 3/5 · пришлите @username бота:",
-                kb_internal(),
+                kb_internal(update.effective_user.id),
             )
             return
         context.user_data["state"] = "internal_visibility"
@@ -8666,7 +8707,7 @@ async def internal_callback(
         await send_ui(
             update, context,
             f"{INTERNAL_VISIBILITIES[visibility]}\n\nШаг 3/5 · пришлите @username или ссылку t.me:",
-            kb_internal(),
+            kb_internal(update.effective_user.id),
         )
         return
 
@@ -8689,7 +8730,7 @@ async def internal_callback(
         target_type = context.user_data.get("internal_target_type")
         visibility = context.user_data.get("internal_visibility")
         if not all([target, reason, target_type, visibility]):
-            await send_ui(update, context, "❌ Данные задания устарели.", kb_internal())
+            await send_ui(update, context, "❌ Данные задания устарели.", kb_internal(update.effective_user.id))
             return
         prepared = render_internal_template(reason, target)
         job_id = create_internal_job(
@@ -8707,7 +8748,7 @@ async def internal_callback(
         await send_ui(
             update, context,
             f"✅ Задание #{job_id} создано.\n\n{prepared}\n\n🚀 Запускаю выполнение...",
-            kb_internal(),
+            kb_internal(update.effective_user.id),
         )
         context.application.create_task(
             execute_internal_job(
@@ -8728,7 +8769,7 @@ async def internal_callback(
         await send_ui(
             update, context,
             "✍️ Шаг 5/5 · пришлите свой текст обращения:",
-            kb_internal(),
+            kb_internal(update.effective_user.id),
         )
         return
 
@@ -8742,7 +8783,7 @@ async def internal_callback(
 
     if data == "internal:sessions:refresh":
         if not is_admin(user_id):
-            await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal())
+            await send_ui(update, context, "❌ Доступ только для администратора.", kb_internal(update.effective_user.id))
             return
         if not internal_storage_ready():
             await show_internal_sessions(update, context)
@@ -9636,7 +9677,7 @@ async def handle_text(
         if not normalized:
             await update.message.reply_text(
                 "❌ Неверная ссылка. Используйте @username или ссылку t.me/...",
-                reply_markup=kb_internal(),
+                reply_markup=kb_internal(update.effective_user.id),
             )
             return
 
@@ -9655,7 +9696,7 @@ async def handle_text(
         visibility = context.user_data.get("internal_visibility")
         if not all([target, reason, target_type, visibility]):
             context.user_data.clear()
-            await update.message.reply_text("❌ Данные задания устарели.", reply_markup=kb_internal())
+            await update.message.reply_text("❌ Данные задания устарели.", reply_markup=kb_internal(update.effective_user.id))
             return
 
         prepared = text[:5000]
@@ -9665,7 +9706,7 @@ async def handle_text(
         context.user_data.clear()
         await update.message.reply_text(
             f"✅ Задание #{job_id} создано.\n\n{prepared}\n\n🚀 Запускаю выполнение...",
-            reply_markup=kb_internal(),
+            reply_markup=kb_internal(update.effective_user.id),
         )
         context.application.create_task(
             execute_internal_job(
@@ -10905,6 +10946,203 @@ async def auto_backup_loop(
 
 
 # =========================================================
+# TARGET WATCH — сторож блокировок
+# =========================================================
+# Следит за целями выполненных заданий: если канал/группа/бот,
+# по которому кидали жалобы, становится недоступен (вероятно,
+# заблокирован Telegram) — каждый пользователь, кидавший на него
+# репорт, получает оповещение в бота.
+
+TARGET_WATCH_INTERVAL_MIN = max(
+    5,
+    int(os.environ.get("TARGET_WATCH_INTERVAL_MIN", "30")),
+)
+
+
+def get_watched_targets(limit: int = 200) -> list[str]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT target
+            FROM internal_jobs
+            WHERE status='done'
+            GROUP BY target
+            ORDER BY MAX(id) DESC
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+    return [row["target"] for row in rows]
+
+
+def get_target_subscribers(target: str) -> list[int]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT user_id
+            FROM internal_jobs
+            WHERE target=%s
+              AND status IN ('done', 'running')
+            """,
+            (target,),
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def get_target_watch(target: str):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM target_watch WHERE target=%s",
+            (target,),
+        ).fetchone()
+
+
+def set_target_watch(target: str, status: str) -> None:
+    now = utcnow()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO target_watch(target, last_status, last_checked_at, updated_at)
+            VALUES(%s,%s,%s,%s)
+            ON CONFLICT(target) DO UPDATE SET
+                last_status=EXCLUDED.last_status,
+                last_checked_at=EXCLUDED.last_checked_at,
+                updated_at=EXCLUDED.updated_at
+            """,
+            (target, status, now, now),
+        )
+        conn.commit()
+
+
+def touch_target_watch(target: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE target_watch
+            SET last_checked_at=%s
+            WHERE target=%s
+            """,
+            (utcnow(), target),
+        )
+        conn.commit()
+
+
+def is_watchable_target(target: str) -> bool:
+    value = (target or "").strip().lower()
+    if not value:
+        return False
+    # Приватные инвайт-ссылки userbot'ом без вступления не проверить.
+    if "/+" in value or "joinchat" in value:
+        return False
+    return True
+
+
+async def check_target_accessible(client, target: str) -> str:
+    """'ok' | 'gone' | 'private' | 'unknown'."""
+    for _attempt in range(2):
+        try:
+            await client.get_entity(target)
+            return "ok"
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds + 1)
+            continue
+        except (UsernameInvalidError, UsernameNotOccupiedError):
+            return "gone"
+        except ChannelPrivateError:
+            return "private"
+        except Exception as exc:
+            logger.warning("watch check failed target=%s: %s", target, exc)
+            return "unknown"
+    return "unknown"
+
+
+async def target_watch_loop(application: Application):
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if not internal_storage_ready():
+                await asyncio.sleep(TARGET_WATCH_INTERVAL_MIN * 60)
+                continue
+            targets = [
+                t for t in get_watched_targets()
+                if is_watchable_target(t)
+            ]
+            if not targets:
+                await asyncio.sleep(TARGET_WATCH_INTERVAL_MIN * 60)
+                continue
+            names = await list_internal_session_files()
+            if not names:
+                await asyncio.sleep(TARGET_WATCH_INTERVAL_MIN * 60)
+                continue
+
+            local = None
+            client = None
+            try:
+                local = await download_internal_session(names[0])
+                client = TelegramClient(
+                    str(local.with_suffix("")),
+                    TELEGRAM_API_ID,
+                    TELEGRAM_API_HASH,
+                )
+                await client.connect()
+                if not await client.is_user_authorized():
+                    return
+
+                for target in targets:
+                    status = await check_target_accessible(client, target)
+                    if status == "unknown":
+                        touch_target_watch(target)
+                        continue
+                    row = get_target_watch(target)
+                    if row is None:
+                        # Первый замер — baseline, без оповещений.
+                        set_target_watch(target, status)
+                        continue
+                    old = row["last_status"]
+                    if old == "ok" and status in ("gone", "private"):
+                        set_target_watch(target, status)
+                        for user_id in get_target_subscribers(target):
+                            try:
+                                await application.bot.send_message(
+                                    user_id,
+                                    "🔔 Цель недоступна\n\n"
+                                    f"🎯 {target}\n\n"
+                                    "Объект стал недоступен — вероятно, "
+                                    "заблокирован Telegram.\n\n"
+                                    "Твои жалобы сработали 💥",
+                                )
+                            except Exception:
+                                pass
+                        log_event(
+                            "INFO",
+                            "target_blocked",
+                            None,
+                            {"target": target, "status": status},
+                        )
+                    elif old != status:
+                        set_target_watch(target, status)
+                    else:
+                        touch_target_watch(target)
+                    await asyncio.sleep(1)
+            finally:
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                if local is not None:
+                    try:
+                        local.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Target watch loop failed")
+        await asyncio.sleep(TARGET_WATCH_INTERVAL_MIN * 60)
+
+
+# =========================================================
 # MIRROR MONITOR
 # =========================================================
 
@@ -10955,10 +11193,34 @@ async def post_init(
         name="mirror-monitor-loop",
     )
 
+    asyncio.create_task(
+        target_watch_loop(
+            application
+        ),
+        name="target-watch-loop",
+    )
+
     # Start all active BotFather-based mirrors after the main bot is ready.
+    # A mirror holding the MAIN token would poll the same bot twice and
+    # cause getUpdates Conflict — skip and deactivate such rows.
     for row in get_active_mirrors():
-        if row.get("bot_token_enc"):
-            schedule_mirror(application, int(row["id"]))
+        if not row.get("bot_token_enc"):
+            continue
+        try:
+            if decrypt_mirror_token(row["bot_token_enc"]) == BOT_TOKEN:
+                logger.error(
+                    "Mirror #%s holds the main BOT_TOKEN, deactivating",
+                    row["id"],
+                )
+                deactivate_mirror(int(row["id"]))
+                continue
+        except Exception:
+            logger.exception(
+                "Could not decrypt mirror #%s, skipping",
+                row["id"],
+            )
+            continue
+        schedule_mirror(application, int(row["id"]))
 
     await resume_pending_crypto_payments(
         application
