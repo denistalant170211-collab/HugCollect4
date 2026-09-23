@@ -260,6 +260,12 @@ REPORT_DELAY_SEC = max(
     0,
     int(os.environ.get("REPORT_DELAY_SEC", "3")),
 )
+# Растяжка старта между аккаунтами: i-й акк ждёт i*STAGGER секунд,
+# чтобы вся пачка не била в одну секунду.
+REPORT_STAGGER_SEC = max(
+    0,
+    int(os.environ.get("REPORT_STAGGER_SEC", "2")),
+)
 INTERNAL_MAX_PARALLEL = max(
     1,
     min(10, int(os.environ.get("INTERNAL_MAX_PARALLEL", "5"))),
@@ -388,6 +394,8 @@ async def _report_with_session(
         except Exception:
             message_ids = []
         for _ in range(per_account):
+            # Пауза ДО выстрела — иначе при per_account=1 она бесполезна.
+            await asyncio.sleep(REPORT_DELAY_SEC + random.uniform(0, 2))
             try:
                 peer_ok = await client(
                     functions.account.ReportPeerRequest(
@@ -439,7 +447,6 @@ async def _report_with_session(
                             )
                     except Exception:
                         pass
-                await asyncio.sleep(REPORT_DELAY_SEC + random.uniform(0, 2))
             except FloodWaitError as exc:
                 await asyncio.sleep(exc.seconds + 2)
             except Exception as exc:
@@ -488,9 +495,11 @@ async def run_internal_reports(
     done = 0
     plan = len(names) * per_account
 
-    async def worker(name: str):
+    async def worker(idx: int, name: str):
         nonlocal total_sent, used, done
         local: Path | None = None
+        # Растягиваем старт, чтобы все аккаунты не били одновременно.
+        await asyncio.sleep(min(idx, 15) * REPORT_STAGGER_SEC + random.uniform(0, 1))
         try:
             async with sem:
                 local = await download_internal_session(name)
@@ -533,7 +542,7 @@ async def run_internal_reports(
                 except Exception:
                     pass
 
-    await asyncio.gather(*[worker(n) for n in names])
+    await asyncio.gather(*[worker(i, n) for i, n in enumerate(names)])
     breakdown.sort(key=lambda r: r["session"])
     return (total_sent, used, errors, breakdown)
 
