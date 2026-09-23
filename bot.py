@@ -25,7 +25,6 @@ from telethon.errors.rpcerrorlist import (
     UsernameNotOccupiedError,
 )
 
-from proxy_pool import ProxyPool, parse_proxy_tuple
 from telethon.tl.functions.channels import JoinChannelRequest
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
@@ -372,23 +371,6 @@ DEVICE_PROFILES = [
     {"device_model": "Redmi Note 13", "system_version": "Android 13", "app_version": "10.2.3"},
 ]
 
-PROXY_MODE = os.environ.get("PROXY_MODE", "auto").strip().lower()
-PROXY_SOURCES = [
-    s.strip()
-    for s in os.environ.get(
-        "PROXY_SOURCES",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt,"
-        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt,"
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    ).split(",")
-    if s.strip()
-]
-PROXY_REFRESH_SEC = max(
-    60,
-    int(os.environ.get("PROXY_REFRESH_SEC", "900")),
-)
-PROXY_POOL = None
-
 # Запущенные задания: job_id -> asyncio.Event для стоп-кнопки.
 RUNNING_JOBS: dict[int, asyncio.Event] = {}
 
@@ -485,45 +467,21 @@ async def _report_with_session(
     base_text: str,
     per_account: int,
     stop_event=None,
-    proxy_url: str | None = None,
 ) -> int:
     sent = 0
     device = random.choice(DEVICE_PROFILES)
-    proxy = parse_proxy_tuple(proxy_url) if proxy_url else None
-
-    def _make_client(proxy_arg):
-        return TelegramClient(
-            session_base,
-            TELEGRAM_API_ID,
-            TELEGRAM_API_HASH,
-            device_model=device["device_model"],
-            system_version=device["system_version"],
-            app_version=device["app_version"],
-            lang_code="ru",
-            system_lang_code="ru-RU",
-            proxy=proxy_arg,
-        )
-
-    client = _make_client(proxy)
+    client = TelegramClient(
+        session_base,
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+        device_model=device["device_model"],
+        system_version=device["system_version"],
+        app_version=device["app_version"],
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
     try:
-        try:
-            await client.connect()
-        except (OSError, asyncio.TimeoutError) as exc:
-            # Прокси сдох — в auto идём напрямую, иначе пропускаем акк.
-            if proxy_url and PROXY_MODE == "auto":
-                if PROXY_POOL is not None:
-                    PROXY_POOL.mark_bad(proxy_url)
-                logger.warning("proxy dead, retry direct: %s", proxy_url)
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                client = _make_client(None)
-                await client.connect()
-            else:
-                raise
-        if proxy_url and PROXY_POOL is not None:
-            PROXY_POOL.mark_good(proxy_url)
+        await client.connect()
         if not await client.is_user_authorized():
             return 0
         try:
@@ -676,12 +634,6 @@ async def run_internal_reports(
                 logger.info("session skipped (quarantine): %s", name)
                 errors.append(f"{name}: quarantined")
             else:
-                proxy_url = None
-                if PROXY_POOL is not None and PROXY_POOL.enabled():
-                    try:
-                        proxy_url = await PROXY_POOL.get_proxy()
-                    except Exception:
-                        proxy_url = None
                 async with sem:
                     local = await download_internal_session(name)
                     base = str(local.with_suffix(""))
@@ -693,7 +645,6 @@ async def run_internal_reports(
                         text,
                         per_account,
                         stop_event=stop_event,
-                        proxy_url=proxy_url,
                     )
                     total_sent += n
                     if n:
@@ -11379,20 +11330,6 @@ async def post_init(
                 logger.error("stale webhook deleted, polling should recover")
     except Exception:
         logger.exception("webhook self-check failed")
-
-    global PROXY_POOL
-    if PROXY_MODE != "off" and PROXY_SOURCES:
-        try:
-            PROXY_POOL = ProxyPool(
-                mode=PROXY_MODE,
-                sources=PROXY_SOURCES,
-                refresh_sec=PROXY_REFRESH_SEC,
-            )
-            await PROXY_POOL.initialize()
-            logger.info("proxy pool init: mode=%s", PROXY_MODE)
-        except Exception:
-            logger.exception("proxy pool init failed, going direct")
-            PROXY_POOL = None
 
     asyncio.create_task(
         expiration_loop(
