@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import unescape
@@ -26,6 +27,9 @@ from telethon.errors.rpcerrorlist import (
 )
 
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.network.connection.tcpmtproxy import (
+    ConnectionTcpMTProxyRandomizedIntermediate as _MTConn,
+)
 from psycopg import errors as psycopg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -371,6 +375,75 @@ DEVICE_PROFILES = [
     {"device_model": "Redmi Note 13", "system_version": "Android 13", "app_version": "10.2.3"},
 ]
 
+# MTProxy (ссылки tg://proxy / t.me/proxy). Список кладётся в env
+# MT_PROXY_LIST через пробел/запятую/переносы строк.
+# Режимы MT_PROXY_MODE: off — напрямую; auto — прокси, сдох — напрямую;
+# force — только прокси, сдох — акк пропускается.
+MT_PROXY_MODE = os.environ.get("MT_PROXY_MODE", "auto").strip().lower()
+if MT_PROXY_MODE not in ("off", "auto", "force"):
+    MT_PROXY_MODE = "auto"
+MT_PROXY_BAD_TTL = max(
+    60,
+    int(os.environ.get("MT_PROXY_BAD_TTL", "3600")),
+)
+
+_MT_LINK_RE = re.compile(
+    r"(?:tg://proxy|https?://t\.me/proxy)\?([^#\s]+)", re.IGNORECASE
+)
+
+
+def parse_mtproxy_links(raw: str) -> list[tuple]:
+    """tg://proxy?server=H&port=P&secret=S -> [(H, P, S), ...]."""
+    out = []
+    for m in _MT_LINK_RE.finditer(raw or ""):
+        try:
+            qs = dict(
+                part.split("=", 1)
+                for part in m.group(1).split("&")
+                if "=" in part
+            )
+            host = qs.get("server", "").strip().rstrip(".")
+            port = int(qs.get("port", "0"))
+            secret = qs.get("secret", "").strip()
+            if host and 0 < port < 65536 and len(secret) >= 32:
+                out.append((host, port, secret))
+        except (ValueError, AttributeError):
+            continue
+    seen, unique = set(), []
+    for item in out:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+MT_PROXIES: list[tuple] = parse_mtproxy_links(os.environ.get("MT_PROXY_LIST", ""))
+_MT_IDX = 0
+_MT_BAD: dict[tuple, float] = {}
+
+
+def mtproxy_next() -> tuple | None:
+    """Следующий живой прокси по кругу. None — идти напрямую."""
+    global _MT_IDX
+    if MT_PROXY_MODE == "off" or not MT_PROXIES:
+        return None
+    now = time.time()
+    for _ in range(len(MT_PROXIES)):
+        cand = MT_PROXIES[_MT_IDX % len(MT_PROXIES)]
+        _MT_IDX += 1
+        bad_until = _MT_BAD.get(cand, 0)
+        if bad_until and bad_until > now:
+            continue
+        _MT_BAD.pop(cand, None)
+        return cand
+    return None
+
+
+def mtproxy_bad(proxy: tuple | None) -> None:
+    if proxy:
+        _MT_BAD[proxy] = time.time() + MT_PROXY_BAD_TTL
+
+
 # Запущенные задания: job_id -> asyncio.Event для стоп-кнопки.
 RUNNING_JOBS: dict[int, asyncio.Event] = {}
 
@@ -467,21 +540,52 @@ async def _report_with_session(
     base_text: str,
     per_account: int,
     stop_event=None,
+    mtproxy: tuple | None = None,
 ) -> int:
     sent = 0
     device = random.choice(DEVICE_PROFILES)
+    client_kwargs: dict = {
+        "device_model": device["device_model"],
+        "system_version": device["system_version"],
+        "app_version": device["app_version"],
+        "lang_code": "ru",
+        "system_lang_code": "ru-RU",
+    }
+    if mtproxy:
+        # MTProxy: RandomizedIntermediate тянет и обычные, и dd-секреты.
+        client_kwargs["connection"] = _MTConn
+        client_kwargs["proxy"] = mtproxy
     client = TelegramClient(
         session_base,
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
-        device_model=device["device_model"],
-        system_version=device["system_version"],
-        app_version=device["app_version"],
-        lang_code="ru",
-        system_lang_code="ru-RU",
+        **client_kwargs,
     )
     try:
-        await client.connect()
+        try:
+            await client.connect()
+        except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+            # MTProxy сдох — в auto идём напрямую, в force пропускаем акк.
+            if mtproxy and MT_PROXY_MODE == "auto":
+                mtproxy_bad(mtproxy)
+                logger.warning("mtproxy dead, retry direct: %s:%s", mtproxy[0], mtproxy[1])
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                del client_kwargs["connection"]
+                del client_kwargs["proxy"]
+                client = TelegramClient(
+                    session_base,
+                    TELEGRAM_API_ID,
+                    TELEGRAM_API_HASH,
+                    **client_kwargs,
+                )
+                await client.connect()
+            else:
+                if mtproxy:
+                    mtproxy_bad(mtproxy)
+                raise
         if not await client.is_user_authorized():
             return 0
         try:
@@ -634,6 +738,7 @@ async def run_internal_reports(
                 logger.info("session skipped (quarantine): %s", name)
                 errors.append(f"{name}: quarantined")
             else:
+                mtproxy = mtproxy_next()
                 async with sem:
                     local = await download_internal_session(name)
                     base = str(local.with_suffix(""))
@@ -645,6 +750,7 @@ async def run_internal_reports(
                         text,
                         per_account,
                         stop_event=stop_event,
+                        mtproxy=mtproxy,
                     )
                     total_sent += n
                     if n:
@@ -11330,6 +11436,9 @@ async def post_init(
                 logger.error("stale webhook deleted, polling should recover")
     except Exception:
         logger.exception("webhook self-check failed")
+
+    if MT_PROXY_MODE != "off":
+        logger.info("mtproxy: mode=%s proxies=%d", MT_PROXY_MODE, len(MT_PROXIES))
 
     asyncio.create_task(
         expiration_loop(
